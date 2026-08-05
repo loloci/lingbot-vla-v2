@@ -436,6 +436,7 @@ If you also set `global_batch_size` explicitly, it must be consistent with the c
 | `align_params.visual_steps` | int | `5000` | Visual logging interval. |
 | `align_params.depth.moge_path` | str | — | Path to MoGe weights. |
 | `align_params.depth.morgbd_path` | str | — | Path to MoRGBD/LingBot-Depth weights. |
+| `align_params.depth.focal_shift_solver` | str | `"scipy"` | Focal/shift recovery backend: `scipy`, `gpu_linear`, or `gpu_lm`. Use `gpu_lm` to enable the batched GPU solver. |
 | `align_params.depth.use_future_depth` | bool | `true` | Enable future-depth targets. |
 | `align_params.depth.block_future_depth_to_action` | bool | `true` | Block gradients from future-depth branch to action branch. |
 | `align_params.depth.future_depth_head_type` | str | `"resampler"` | Future-depth head type. |

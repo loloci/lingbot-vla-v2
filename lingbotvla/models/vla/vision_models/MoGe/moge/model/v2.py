@@ -201,6 +201,7 @@ class MoGeModel(nn.Module):
         apply_mask: bool = True,
         fov_x: Optional[Union[Number, torch.Tensor]] = None,
         use_fp16: bool = True,
+        focal_shift_solver: str = "scipy",
     ) -> Dict[str, torch.Tensor]:
         """
         User-friendly inference function
@@ -213,6 +214,8 @@ class MoGeModel(nn.Module):
         - `apply_mask`: if True, the output point map will be masked using the predicted mask. Default: True
         - `fov_x`: the horizontal camera FoV in degrees. If None, it will be inferred from the predicted point map. Default: None
         - `use_fp16`: if True, use mixed precision to speed up inference. Default: True
+        - `focal_shift_solver`: focal/shift recovery backend. One of `scipy`,
+            `gpu_linear`, or `gpu_lm`. Default: `scipy`.
             
         ### Returns
 
@@ -255,13 +258,13 @@ class MoGeModel(nn.Module):
                 # NOTE: Focal here is the focal length relative to half the image diagonal
                 if fov_x is None:
                     # Recover focal and shift from predicted point map
-                    focal, shift = recover_focal_shift(points, mask_binary)
+                    focal, shift = recover_focal_shift(points, mask_binary, solver=focal_shift_solver)
                 else:
                     # Focal is known, recover shift only
                     focal = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / torch.tan(torch.deg2rad(torch.as_tensor(fov_x, device=points.device, dtype=points.dtype) / 2))
                     if focal.ndim == 0:
                         focal = focal[None].expand(points.shape[0])
-                    _, shift = recover_focal_shift(points, mask_binary, focal=focal)
+                    _, shift = recover_focal_shift(points, mask_binary, focal=focal, solver=focal_shift_solver)
                 fx, fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio, focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 
                 intrinsics = utils3d.pt.intrinsics_from_focal_center(fx, fy, torch.tensor(0.5, device=points.device, dtype=points.dtype), torch.tensor(0.5, device=points.device, dtype=points.dtype))
                 points[..., 2] += shift[..., None, None]

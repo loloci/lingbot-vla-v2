@@ -308,6 +308,7 @@ class MoGeModel(nn.Module):
         apply_mask: bool = True,
         force_projection: bool = True,
         use_fp16: bool = True,
+        focal_shift_solver: str = "scipy",
     ) -> Dict[str, torch.Tensor]:
         """
         User-friendly inference function
@@ -357,12 +358,12 @@ class MoGeModel(nn.Module):
 
             # Get camera-space point map. (Focal here is the focal length relative to half the image diagonal)
             if fov_x is None:
-                focal, shift = recover_focal_shift(points, mask_binary)
+                focal, shift = recover_focal_shift(points, mask_binary, solver=focal_shift_solver)
             else:
                 focal = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / torch.tan(torch.deg2rad(torch.as_tensor(fov_x, device=points.device, dtype=points.dtype) / 2))
                 if focal.ndim == 0:
                     focal = focal[None].expand(points.shape[0])
-                _, shift = recover_focal_shift(points, mask_binary, focal=focal)
+                _, shift = recover_focal_shift(points, mask_binary, focal=focal, solver=focal_shift_solver)
             fx = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio
             fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 
             intrinsics = utils3d.pt.intrinsics_from_focal_center(fx, fy, torch.tensor(0.5, device=points.device, dtype=points.dtype), torch.tensor(0.5, device=points.device, dtype=points.dtype))

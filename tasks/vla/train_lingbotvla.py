@@ -403,7 +403,13 @@ def main():
             raise ValueError(f"Only MoRGBD depth distillation is supported, got {depth_model_type!r}.")
         depth_loss_weight = args.train.align_params.get("depth_loss_weight", 1.0)
         future_depth_loss_weight = args.train.align_params.get("future_depth_loss_weight", 1.0)
-        print('====Loading Depth Model====')
+        focal_shift_solver = args.train.align_params['depth'].get('focal_shift_solver', 'scipy')
+        if focal_shift_solver not in ('scipy', 'gpu_linear', 'gpu_lm'):
+            raise ValueError(
+                "align_params.depth.focal_shift_solver must be one of "
+                f"'scipy' | 'gpu_linear' | 'gpu_lm', got {focal_shift_solver!r}"
+            )
+        print(f"====Loading Depth Model (focal_shift_solver={focal_shift_solver})====")
         moge_model, morgbd_model = build_depth_model(args.train.align_params)
         if args.train.use_compile:
             moge_model = torch.compile(moge_model)
@@ -758,9 +764,19 @@ def main():
                         pil_images = micro_batch.pop('pil_images', None)
                         future_pil_images = micro_batch.pop('future_pil_images', None) if (use_future_depth or use_future_video) else None
                         with torch.autocast("cuda", dtype=torch.bfloat16):
-                            depth_targets, cls_token = get_depth_target(depth_model_type, (moge_model, morgbd_model), pil_images)
+                            depth_targets, cls_token = get_depth_target(
+                                depth_model_type,
+                                (moge_model, morgbd_model),
+                                pil_images,
+                                focal_shift_solver=focal_shift_solver,
+                            )
                             if use_future_depth:
-                                future_depth_targets, future_cls_token = get_depth_target(depth_model_type, (moge_model, morgbd_model), future_pil_images)
+                                future_depth_targets, future_cls_token = get_depth_target(
+                                    depth_model_type,
+                                    (moge_model, morgbd_model),
+                                    future_pil_images,
+                                    focal_shift_solver=focal_shift_solver,
+                                )
                         if use_future_video:
                             with torch.autocast("cuda", dtype=torch.bfloat16):
                                 future_video_target_bundle = get_video_target(
