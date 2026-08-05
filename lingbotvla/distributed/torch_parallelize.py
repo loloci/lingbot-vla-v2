@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import os
 import types
 from functools import partial
 from typing import Any, Dict, List, Optional
@@ -47,6 +48,12 @@ if is_torch_version_greater_than("2.4"):
 
 
 logger = logging.get_logger(__name__)
+
+
+# Escape hatch for reproducing the pre-optimization FSDP2 behavior. By default,
+# parameters stay unsharded between the two backward passes in the dual-call
+# architecture when reshard_after_forward is disabled.
+_KEEP_RESHARD_AFTER_BACKWARD = os.environ.get("LINGBOT_KEEP_RESHARD_AFTER_BACKWARD", "0") == "1"
 
 def _resolve(root: Any, paths: List[tuple[str, ...]]) -> tuple[Optional[Any], Optional[tuple[str, ...]]]:
     for path in paths:
@@ -147,7 +154,10 @@ def build_parallelize_model(
         fsdp_no_shard_states_fqn = None
 
     if parallel_state.fsdp_enabled:
-        logger.info_rank0(f"Apply data parallel to the model: {parallel_state.dp_mode}.")
+        logger.info_rank0(
+            f"Apply data parallel to the model: {parallel_state.dp_mode}, "
+            f"reshard_after_forward={enable_full_shard}."
+        )
         if parallel_state.dp_mode == "fsdp2":
             def merge_ignored_params(fsdp_options: Dict[str, Any], params: set) -> None:
                 if not params:
@@ -286,6 +296,11 @@ def build_parallelize_model(
                         fully_shard(module, **{k: v for k, v in module_fsdp_kwargs.items() if k != "mp_policy"})
                     else:
                         fully_shard(module, **module_fsdp_kwargs)
+                    # The dual-call architecture executes each decoder layer twice
+                    # per step. Keep parameters unsharded between its two backward
+                    # passes to avoid a redundant AllGather before the second pass.
+                    if not _KEEP_RESHARD_AFTER_BACKWARD:
+                        module.set_reshard_after_backward(enable_full_shard)
 
             if basic_modules:
                 model.apply(apply_fsdp_to_decoder_blocks)
@@ -333,9 +348,13 @@ def build_parallelize_model(
                 for i, layer in enumerate(layers):
                     logger.debug(f"Sharding layer {i} ({layer.__class__.__name__})")
                     fully_shard(layer, **module_local_fsdp_kwargs(layer, fsdp_kwargs))
+                    if not _KEEP_RESHARD_AFTER_BACKWARD:
+                        layer.set_reshard_after_backward(enable_full_shard)
                 for i, layer in enumerate(expert_layers):
                     logger.debug(f"Sharding layer {i} ({layer.__class__.__name__})")
                     fully_shard(layer, **module_local_fsdp_kwargs(layer, fsdp_kwargs))
+                    if not _KEEP_RESHARD_AFTER_BACKWARD:
+                        layer.set_reshard_after_backward(enable_full_shard)
             
             if vlm_fsdp:
                 llm_layers, llm_path = _resolve(model.model.qwenvl_with_expert.qwenvl, [
@@ -362,6 +381,10 @@ def build_parallelize_model(
                     if layer.__class__.__name__ in FSDP_LAYER_CLASS_NAMES:
                         logger.info_rank0(f"Apply FSDP2 to {layer.__class__.__name__}.")
                         fully_shard(layer, **mp_fsdp_kwargs)
+                        # Qwen-VL decoder layers participate in the same dual-call
+                        # loop and need the matching backward reshard policy.
+                        if not _KEEP_RESHARD_AFTER_BACKWARD:
+                            layer.set_reshard_after_backward(enable_full_shard)
 
             fully_shard(model, **mp_fsdp_kwargs)
 
