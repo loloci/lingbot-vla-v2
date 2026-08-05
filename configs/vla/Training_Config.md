@@ -449,6 +449,7 @@ If you also set `global_batch_size` explicitly, it must be consistent with the c
 | `align_params.video.future_video_loss_weight` | float | `0.004` | Future-video loss weight. |
 | `align_params.video.use_patch_loss` | bool | `true` | Enable DINO patch alignment. |
 | `align_params.video.use_current_patch_loss` | bool | `true` | Enable current-frame DINO patch alignment. |
+| `enable_teacher_fsdp_prefetch` | bool | `false` | Overlap the FSDP2 root AllGather with video-teacher execution. Requires FSDP2 and future-video supervision. |
 
 
 ---

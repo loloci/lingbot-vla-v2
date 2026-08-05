@@ -495,6 +495,27 @@ def main():
         use_future_image=args.data.use_future_image,
     )
     logger.info_rank0(model)
+
+    # Capture the FSDP2 root before torch.compile wraps it in an
+    # OptimizedModule, which does not expose FSDPModule.unshard(). Root unshard
+    # is non-recursive; decoder and expert FSDP modules keep lazy prefetching.
+    fsdp_prefetch_root = None
+    if (
+        args.train.enable_teacher_fsdp_prefetch
+        and args.train.data_parallel_mode == "fsdp2"
+        and use_future_video
+    ):
+        if not hasattr(model, "unshard"):
+            raise RuntimeError(
+                "enable_teacher_fsdp_prefetch=True but the FSDP2 root does not "
+                "expose unshard()."
+            )
+        fsdp_prefetch_root = model
+        logger.info_rank0(
+            "Teacher FSDP prefetch enabled: overlapping the root unshard "
+            "with video teacher forward."
+        )
+
     if args.train.use_compile:
         model = torch.compile(model)
 
@@ -777,6 +798,11 @@ def main():
                                     future_pil_images,
                                     focal_shift_solver=focal_shift_solver,
                                 )
+                        # Launch before submitting video-teacher kernels so the
+                        # root AllGather can overlap with that GPU work.
+                        fsdp_prefetch_handle = None
+                        if fsdp_prefetch_root is not None:
+                            fsdp_prefetch_handle = fsdp_prefetch_root.unshard(async_op=True)
                         if use_future_video:
                             with torch.autocast("cuda", dtype=torch.bfloat16):
                                 future_video_target_bundle = get_video_target(
@@ -796,6 +822,8 @@ def main():
                                     future_video_targets = future_video_target_bundle
                             future_video_current_rgb = pil_images
                             future_video_target_rgb = future_pil_images
+                        if fsdp_prefetch_handle is not None:
+                            fsdp_prefetch_handle.wait()
                         depth_forward_time = time.time() - depth_start_time
 
                 with model_fwd_context:

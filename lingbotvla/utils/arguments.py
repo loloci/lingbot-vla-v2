@@ -539,6 +539,15 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Whether or not to record the stack traces."},
     )
+    enable_teacher_fsdp_prefetch: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Overlap the FSDP2 root unshard with the video teacher forward. "
+                "Only effective with FSDP2 and future-video supervision."
+            )
+        },
+    )
     max_steps: Optional[int] = field(
         default=None,
         metadata={"help": "Global max training steps. If None, train until all epochs are completed."},
