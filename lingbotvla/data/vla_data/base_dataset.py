@@ -78,11 +78,35 @@ class LeRobotDataset(BaseLeRobotDataset):
         super().__init__(repo_id, **kwargs)
         self.load_image = load_image
 
+    def _column_view(self, key: str):
+        """A cached one-column view of hf_dataset, for column-first gathers.
+
+        Memoized per key via `self.__dict__` so `__init__` is untouched and a rank
+        that never gathers `key` never pays for it (57.6 ms for all 4 keys, once per
+        worker process). `select_columns` is `@transmit_format`-decorated, so the
+        view inherits the parent's torch transform.
+        Why: report/04_dataloader_column_gather/README.md §2.3, 附录 A.2
+        """
+        views = self.__dict__.get("_column_views")
+        if views is None:
+            views = self.__dict__["_column_views"] = {}
+        view = views.get(key)
+        if view is None:
+            view = views[key] = self.hf_dataset.select_columns([key])
+        return view
+
     def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
         """
         Query dataset for indices across keys, skipping video keys.
 
-        Tries column-first [key][indices] for speed, falls back to row-first.
+        Gathers COLUMN-first, through a cached one-column view (`_column_view`).
+        Do not "simplify" this back to `hf_dataset[indices][key]`: `datasets` formats
+        whole rows and 3 camera columns are `Image(decode=True)`, so row-first decodes
+        168 PNGs per sample where 6 are wanted (1487.5 ms, of which 1437.7 ms is
+        waste). The literal `hf_dataset[key][indices]` form named in the old docstring
+        does not work on datasets 3.6.0 at all. Values are bit-identical — verified by
+        tools/verify_column_gather.py; rerun it before touching this.
+        Why: report/04_dataloader_column_gather/README.md §2, §5
 
         Args:
             query_indices: Dict mapping keys to index lists to retrieve
@@ -96,7 +120,7 @@ class LeRobotDataset(BaseLeRobotDataset):
                 continue
             # Map absolute indices to relative indices if needed
             relative_indices = _to_relative_indices(self, q_idx)
-            result[key] = torch.stack(self.hf_dataset[relative_indices][key])
+            result[key] = torch.stack(self._column_view(key)[relative_indices][key])
         return result
 
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
