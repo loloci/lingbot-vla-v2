@@ -539,6 +539,21 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Whether or not to record the stack traces."},
     )
+    enable_perf_ranges: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Emit torch.cuda.nvtx + torch.profiler.record_function ranges. Currently "
+                "wired to DistributedMuon's per-chunk instrumentation "
+                "(muon_group/pack/ag/ns/apply per shape-group chunk, plus CUDA-event "
+                "timings dumped to muon_chunk_stats_step{N}.json at profile_end_step). "
+                "All-rank emission (no rank guard) so multi-rank nsys traces align by "
+                "chunk index. Requires nsys --trace=nvtx or the torch profiler for the "
+                "ranges to be captured. LINGBOT_MUON_PROFILE=1 flips the Muon half on "
+                "independently of this flag."
+            )
+        },
+    )
     enable_teacher_fsdp_prefetch: bool = field(
         default=False,
         metadata={

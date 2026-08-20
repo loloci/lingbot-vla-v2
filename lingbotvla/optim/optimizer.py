@@ -311,6 +311,12 @@ def build_muon_optimizer(
         nesterov=bool(getattr(args_train, "muon_nesterov", True)),
         ns_steps=int(getattr(args_train, "muon_ns_steps", 5)),
         adjust_lr_fn=getattr(args_train, "muon_adjust_lr_fn", "match_rms_adamw"),
+        # Emit NVTX ranges + per-chunk metadata when the training script has
+        # its own `_perf_range` instrumentation enabled — same knob. Toggling
+        # only lifts the no-op guard; ranges are still emitted uniformly on
+        # every rank so nsys traces stay aligned. Env var
+        # ``LINGBOT_MUON_PROFILE=1`` also flips it inside DistributedMuon.
+        enable_nvtx=bool(getattr(args_train, "enable_perf_ranges", False)),
     )
 
     inner_opts: List[Optimizer] = [muon_opt]

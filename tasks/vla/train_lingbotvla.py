@@ -1139,6 +1139,30 @@ def main():
                     profiler.step()
                     if global_step == args.train.profile_end_step:
                         profiler.stop()
+                        # Dump DistributedMuon per-chunk stats (shape, dtype,
+                        # AG in/out bytes, pack/AG/NS/apply ms, last-read
+                        # index) collected while enable_perf_ranges was on.
+                        # Rank0 only so the JSON isn't stomped by 16 writers.
+                        # Silent no-op when Muon wasn't used or nvtx was off.
+                        if args.train.local_rank == 0 and args.train.optimizer == "muon":
+                            try:
+                                muon_opt = optimizer.optimizers[0]
+                                if hasattr(muon_opt, "dump_stats") and getattr(
+                                    muon_opt, "_muon_stats", None
+                                ):
+                                    stats_path = os.path.join(
+                                        args.train.profile_trace_dir,
+                                        f"muon_chunk_stats_step{global_step}.json",
+                                    )
+                                    os.makedirs(args.train.profile_trace_dir, exist_ok=True)
+                                    muon_opt.dump_stats(stats_path, rank=0)
+                                    logger.info_rank0(
+                                        f"[muon-nvtx] dumped {stats_path}"
+                                    )
+                            except Exception as _muon_dump_err:  # noqa: BLE001
+                                logger.info_rank0(
+                                    f"[muon-nvtx] dump_stats failed: {_muon_dump_err!r}"
+                                )
                         helper.upload_trace(
                             args.train.wandb_project, args.train.wandb_name, args.train.profile_trace_dir
                         )

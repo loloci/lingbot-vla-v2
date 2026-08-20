@@ -10,6 +10,7 @@ with one batched NS pass, and scattered back locally.
 
 from collections import defaultdict
 import math
+import os
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
@@ -194,6 +195,65 @@ _KIND_MOE_LOCAL_3D = "moe_local_3d"
 _KIND_MOE_GATHER_3D = "moe_gather_3d"
 
 
+# --------------------------------------------------------------------------- #
+# Instrumentation: per-shape-group NVTX + metadata for the DistributedMuon
+# double-buffer redesign work (see memory/experiments/profile-analysis-260727).
+#
+# The synchronous baseline emits 5 NVTX ranges per shape-group chunk:
+#   muon_group/{i}   ..  full chunk (pack + AG + NS + apply)
+#     muon_pack/{i}  ..  Phase 1 momentum + Phase 2 stack/pad
+#     muon_ag/{i}    ..  dist.all_gather + reconstruction cat/narrow
+#     muon_ns/{i}    ..  batched Newton-Schulz on the gathered tensor
+#     muon_apply/{i} ..  narrow-view scatter + per-param add_ into params
+# The END of `muon_apply/{i}` marks the last read of chunk i's AG-derived
+# buffer, i.e. the earliest safe point to reuse slot i in a future async
+# double-buffered scheduler.
+#
+# Chunk numbering (`{i}`) is monotonic across the whole `.step()` call and
+# identical on every rank, so multi-rank nsys traces align by chunk_idx.
+# --------------------------------------------------------------------------- #
+
+_MUON_PROFILE_ENV = "LINGBOT_MUON_PROFILE"
+
+
+def _muon_profile_enabled() -> bool:
+    """Whether to emit per-chunk NVTX ranges and collect chunk metadata.
+
+    Enable with ``LINGBOT_MUON_PROFILE=1`` in the training env. Off by
+    default so unrelated runs pay zero cost.
+    """
+    return os.environ.get(_MUON_PROFILE_ENV, "").lower() in ("1", "true", "yes", "on")
+
+
+class _MuonPerfRange:
+    """CUDA NVTX + torch.profiler.record_function; no-op when ``enabled=False``.
+
+    Mirrors the ``_perf_range`` helper in ``tasks/vla/train_lingbotvla.py``
+    (kept local here so the optimizer stays free of task-side imports).
+    Every rank emits when enabled — required for multi-rank nsys alignment.
+    """
+
+    __slots__ = ("_name", "_enabled", "_rf")
+
+    def __init__(self, name: str, enabled: bool) -> None:
+        self._name = name
+        self._enabled = enabled
+        self._rf = None
+
+    def __enter__(self):
+        if self._enabled:
+            torch.cuda.nvtx.range_push(self._name)
+            self._rf = torch.profiler.record_function(self._name)
+            self._rf.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._enabled and self._rf is not None:
+            self._rf.__exit__(exc_type, exc_val, exc_tb)
+            torch.cuda.nvtx.range_pop()
+        return False
+
+
 def _shard_dims(p: DTensor) -> List[int]:
     """Return the list of tensor dims along which ``p`` is sharded."""
     return [pl.dim for pl in p.placements if isinstance(pl, Shard)]
@@ -275,6 +335,7 @@ class DistributedMuon(Optimizer):
         eps: float = EPS,
         ns_steps: int = DEFAULT_NS_STEPS,
         adjust_lr_fn: Optional[str] = None,
+        enable_nvtx: bool = False,
     ) -> None:
         if isinstance(lr, Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
@@ -299,6 +360,84 @@ class DistributedMuon(Optimizer):
         }
         super().__init__(params, defaults)
 
+        # Instrumentation state — always initialized; controls whether NVTX
+        # ranges and per-chunk metadata are emitted. Effective enable = ctor
+        # kwarg OR env var LINGBOT_MUON_PROFILE=1.
+        self._enable_nvtx: bool = bool(enable_nvtx) or _muon_profile_enabled()
+        # Chunk-level metadata list, appended once per _step_megabatch_chunk
+        # call. Reset at the start of every step() so `.step_index` is
+        # monotonic within a step and step-to-step comparisons are trivial.
+        # Entries collect (in insertion / call order):
+        #   {
+        #     "chunk_idx":         monotonic int within this step,
+        #     "shape":             tuple(global param shape),
+        #     "dtype":             str(param dtype),
+        #     "param_count":       N params in this chunk (grad and no-grad),
+        #     "with_grad_count":   how many had a real grad,
+        #     "world_size":        pg world size,
+        #     "shard_dim":         which dim is FSDP-sharded,
+        #     "local_size":        local shard size on this rank pre-pad,
+        #     "max_local_size":    ceil(global/world) — the actual AG chunk size,
+        #     "ag_in_bytes":       nbytes of the tensor handed to all_gather,
+        #     "ag_out_bytes":      cumulative nbytes of gather_list buffers,
+        #     "pack_ms":           Phase 1+early-Phase 2 CUDA elapsed_time,
+        #     "ag_ms":             Phase 2 AG + reconstruction elapsed_time,
+        #     "ns_ms":             Phase 3 batched NS elapsed_time,
+        #     "apply_ms":          Phase 4 scatter+apply elapsed_time,
+        #     "last_read_iter":    Phase 4 last iter index that touched buffer,
+        #   }
+        # ``_muon_events`` holds the raw (start, end) event pairs; timings are
+        # computed lazily via ``dump_stats(...)`` after CUDA sync at step end.
+        self._muon_stats: List[Dict[str, Any]] = []
+        self._muon_events: List[Dict[str, Any]] = []
+        self._muon_step_counter: int = 0
+        self._muon_chunk_counter: int = 0
+
+    def set_enable_nvtx(self, enabled: bool) -> None:
+        """Toggle instrumentation at runtime (e.g. during profile window only)."""
+        self._enable_nvtx = bool(enabled) or _muon_profile_enabled()
+
+    def _make_event_pair(self) -> Tuple["torch.cuda.Event", "torch.cuda.Event"]:
+        """Return a (start, end) CUDA event pair with timing enabled."""
+        return (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+
+    def dump_stats(self, path: str, rank: int = 0) -> None:
+        """Sync CUDA, resolve event timings, and dump per-chunk metadata to JSON.
+
+        Only call this from the rank whose stats you want to persist (typically
+        rank 0). ``self._muon_stats`` and ``self._muon_events`` are cleared
+        after a successful dump so subsequent steps start fresh.
+        """
+        import json  # local import — dump_stats is a rare / offline path
+
+        if not self._muon_events:
+            return
+
+        # Force in-order completion of all recorded ranges before elapsed_time.
+        torch.cuda.synchronize()
+
+        for stat, ev in zip(self._muon_stats, self._muon_events):
+            stat["pack_ms"] = ev["pack_s"].elapsed_time(ev["pack_e"])
+            stat["ag_ms"] = ev["ag_s"].elapsed_time(ev["ag_e"])
+            stat["ns_ms"] = ev["ns_s"].elapsed_time(ev["ns_e"])
+            stat["apply_ms"] = ev["apply_s"].elapsed_time(ev["apply_e"])
+
+        payload = {
+            "rank": int(rank),
+            "step_index": int(self._muon_step_counter),
+            "num_chunks": len(self._muon_stats),
+            "chunks": self._muon_stats,
+        }
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2, sort_keys=False)
+
+        # Clear so the caller can call dump_stats every N steps without leaks.
+        self._muon_stats = []
+        self._muon_events = []
+
         for group in self.param_groups:
             for p in group["params"]:
                 if not _is_muon_eligible_ndim(p):
@@ -315,6 +454,12 @@ class DistributedMuon(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        # Reset per-step counters. `_muon_stats` and `_muon_events` accumulate
+        # across steps until dump_stats() clears them — this lets the caller
+        # dump once at the end of the profile window instead of every step.
+        self._muon_step_counter += 1
+        self._muon_chunk_counter = 0
 
         for group in self.param_groups:
             lr = float(group["lr"])
@@ -435,13 +580,20 @@ class DistributedMuon(Optimizer):
         lr_shape = params[0].shape[-2:]
         adjusted_lr = _adjust_lr(lr, adjust_lr_fn, lr_shape)
 
-        # Process in sub-batches to bound peak memory
+        # Process in sub-batches to bound peak memory.
+        # Emit ``muon_group/{i}`` as an umbrella range over each chunk so a
+        # nsys viewer can collapse a whole shape-group into a single block.
+        # Chunk index is grabbed BEFORE calling _step_megabatch_chunk (which
+        # bumps the counter) so the umbrella name matches the inner
+        # ``muon_pack/{i}`` / ``muon_ag/{i}`` etc. ranges.
         for batch_start in range(0, N, _MEGABATCH_MAX_GROUP_SIZE):
             batch_params = params[batch_start:batch_start + _MEGABATCH_MAX_GROUP_SIZE]
-            self._step_megabatch_chunk(
-                batch_params, momentum, nesterov, ns_coefficients, ns_steps,
-                eps, lr, weight_decay, adjusted_lr, pg, world_size, rank, shard_dim,
-            )
+            group_idx = self._muon_chunk_counter
+            with _MuonPerfRange(f"muon_group/{group_idx}", self._enable_nvtx):
+                self._step_megabatch_chunk(
+                    batch_params, momentum, nesterov, ns_coefficients, ns_steps,
+                    eps, lr, weight_decay, adjusted_lr, pg, world_size, rank, shard_dim,
+                )
 
     def _step_megabatch_chunk(
         self,
@@ -459,98 +611,187 @@ class DistributedMuon(Optimizer):
         rank: int,
         shard_dim: int,
     ) -> None:
-        """Core mega-batch logic for a chunk of same-shape params."""
-        # Phase 1: Momentum update on LOCAL tensors (no DTensor ops).
-        # This avoids issues with torch.compile which may produce non-DTensor grads.
-        # Params with grad=None contribute zeros (they must still participate in
-        # the collective to keep all ranks in sync).
-        local_updates: List[Tensor] = []
-        has_grad: List[bool] = []
-        for p in params:
-            if p.grad is None:
-                # No grad — contribute zeros to the collective
-                p_local = p.to_local() if isinstance(p, DTensor) else p
-                local_updates.append(torch.zeros_like(p_local))
-                has_grad.append(False)
-                continue
+        """Core mega-batch logic for a chunk of same-shape params.
 
-            has_grad.append(True)
-            state = self.state[p]
-            if "momentum_buffer" not in state:
-                state["momentum_buffer"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-            buf = state["momentum_buffer"]
+        Emits (when ``self._enable_nvtx``) 5 nested NVTX ranges per call:
+        ``muon_group/{i}`` > ``muon_pack/{i}`` / ``muon_ag/{i}`` /
+        ``muon_ns/{i}`` / ``muon_apply/{i}``. Records the chunk's shape,
+        dtype, AG in/out bytes, and per-phase CUDA elapsed times into
+        ``self._muon_stats`` / ``self._muon_events`` for offline diff against
+        the future double-buffered scheduler.
+        """
+        chunk_idx = self._muon_chunk_counter
+        self._muon_chunk_counter += 1
+        instr = self._enable_nvtx
 
-            buf_local = buf.to_local() if isinstance(buf, DTensor) else buf
-            grad_local = p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad
+        # Per-chunk stats scaffold — filled progressively; timings resolved
+        # lazily in ``dump_stats`` after a global CUDA sync.
+        stat: Dict[str, Any] = {
+            "chunk_idx": chunk_idx,
+            "shape": tuple(params[0].shape) if params else (),
+            "dtype": str(params[0].dtype) if params else "",
+            "param_count": len(params),
+            "with_grad_count": 0,
+            "world_size": int(world_size),
+            "shard_dim": int(shard_dim),
+            "local_size": 0,
+            "max_local_size": 0,
+            "ag_in_bytes": 0,
+            "ag_out_bytes": 0,
+            "pack_ms": None,
+            "ag_ms": None,
+            "ns_ms": None,
+            "apply_ms": None,
+            "last_read_iter": -1,
+        }
+        if instr:
+            pack_s, pack_e = self._make_event_pair()
+            ag_s, ag_e = self._make_event_pair()
+            ns_s, ns_e = self._make_event_pair()
+            apply_s, apply_e = self._make_event_pair()
 
-            buf_local.lerp_(grad_local, 1 - momentum)
-            if nesterov:
-                update_local = grad_local.lerp(buf_local, momentum)
+        # NB: the outer ``muon_group/{i}`` range is opened by _step_megabatch
+        # (so multi-chunk shape groups get a single umbrella range on nsys).
+        # Here we only emit the four inner phases.
+
+        with _MuonPerfRange(f"muon_pack/{chunk_idx}", instr):
+            if instr:
+                pack_s.record()
+            # Phase 1: Momentum update on LOCAL tensors (no DTensor ops).
+            # This avoids issues with torch.compile which may produce non-DTensor grads.
+            # Params with grad=None contribute zeros (they must still participate in
+            # the collective to keep all ranks in sync).
+            local_updates: List[Tensor] = []
+            has_grad: List[bool] = []
+            for p in params:
+                if p.grad is None:
+                    # No grad — contribute zeros to the collective
+                    p_local = p.to_local() if isinstance(p, DTensor) else p
+                    local_updates.append(torch.zeros_like(p_local))
+                    has_grad.append(False)
+                    continue
+
+                has_grad.append(True)
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                buf = state["momentum_buffer"]
+
+                buf_local = buf.to_local() if isinstance(buf, DTensor) else buf
+                grad_local = p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad
+
+                buf_local.lerp_(grad_local, 1 - momentum)
+                if nesterov:
+                    update_local = grad_local.lerp(buf_local, momentum)
+                else:
+                    update_local = buf_local.clone()
+
+                local_updates.append(update_local)
+
+            # Phase 2 (pack half): Stack local updates.
+            stacked_local = torch.stack(local_updates, dim=0)  # [N, local_M, K]
+            del local_updates
+
+            gather_dim = shard_dim + 1  # +1 for the batch dim we prepended
+            original_local_size = stacked_local.size(gather_dim)
+
+            # FSDP2 contiguous chunking may give different ranks different local sizes
+            # (ceil vs floor when global_dim % world_size != 0). dist.all_gather
+            # requires uniform sizes. Pad to max_local_size before gathering.
+            global_dim_size = params[0].shape[shard_dim]  # DTensor .shape = global
+            max_local_size = (global_dim_size + world_size - 1) // world_size
+            needs_padding = (max_local_size != original_local_size)
+
+            if needs_padding:
+                pad_amount = max_local_size - original_local_size
+                ndim = stacked_local.ndim
+                pad_spec = [0] * (2 * ndim)
+                pad_idx = 2 * (ndim - 1 - gather_dim)
+                pad_spec[pad_idx + 1] = pad_amount
+                stacked_local = torch.nn.functional.pad(stacked_local, pad_spec)
+
+            if instr:
+                pack_e.record()
+                stat["with_grad_count"] = int(sum(has_grad))
+                stat["local_size"] = int(original_local_size)
+                stat["max_local_size"] = int(max_local_size)
+
+        with _MuonPerfRange(f"muon_ag/{chunk_idx}", instr):
+            if instr:
+                ag_s.record()
+            gather_list = [torch.empty_like(stacked_local) for _ in range(world_size)]
+            if instr:
+                stat["ag_in_bytes"] = int(stacked_local.numel() * stacked_local.element_size())
+                # gather_list buffers include this rank's own slot (== ag_in),
+                # matching the on-wire AG payload accounting.
+                stat["ag_out_bytes"] = int(
+                    world_size * stacked_local.numel() * stacked_local.element_size()
+                )
+            dist.all_gather(gather_list, stacked_local.contiguous(), group=pg)
+            del stacked_local
+
+            # Reconstruct full global tensor, stripping per-rank padding if needed.
+            remainder = global_dim_size % world_size
+            if remainder == 0:
+                stacked_full = torch.cat(gather_list, dim=gather_dim)
             else:
-                update_local = buf_local.clone()
+                real_chunks = []
+                for r in range(world_size):
+                    real_size = max_local_size if r < remainder else (global_dim_size // world_size)
+                    real_chunks.append(gather_list[r].narrow(gather_dim, 0, real_size))
+                stacked_full = torch.cat(real_chunks, dim=gather_dim)
+            del gather_list
+            if instr:
+                ag_e.record()
 
-            local_updates.append(update_local)
+        with _MuonPerfRange(f"muon_ns/{chunk_idx}", instr):
+            if instr:
+                ns_s.record()
+            # Phase 3: Batched Newton-Schulz
+            stacked_ortho = batched_newton_schulz(stacked_full, ns_coefficients, ns_steps, eps)
+            del stacked_full
+            if instr:
+                ns_e.record()
 
-        # Phase 2: Stack and batched all-gather
-        stacked_local = torch.stack(local_updates, dim=0)  # [N, local_M, K]
-        del local_updates
+        with _MuonPerfRange(f"muon_apply/{chunk_idx}", instr):
+            if instr:
+                apply_s.record()
+            # Phase 4: Local scatter + apply update
+            chunk_floor = global_dim_size // world_size
+            shard_start = rank * chunk_floor + min(rank, remainder)
+            local_ortho_batch = stacked_ortho.narrow(
+                gather_dim, shard_start, original_local_size
+            ).contiguous()
+            del stacked_ortho
 
-        gather_dim = shard_dim + 1  # +1 for the batch dim we prepended
-        original_local_size = stacked_local.size(gather_dim)
+            last_read = -1
+            for i, p in enumerate(params):
+                if not has_grad[i]:
+                    continue
+                ortho_local = local_ortho_batch[i]
+                p_local = p.to_local() if isinstance(p, DTensor) else p
 
-        # FSDP2 contiguous chunking may give different ranks different local sizes
-        # (ceil vs floor when global_dim % world_size != 0). dist.all_gather
-        # requires uniform sizes. Pad to max_local_size before gathering.
-        global_dim_size = params[0].shape[shard_dim]  # DTensor .shape = global
-        max_local_size = (global_dim_size + world_size - 1) // world_size
-        needs_padding = (max_local_size != original_local_size)
+                if weight_decay != 0.0:
+                    p_local.mul_(1 - lr * weight_decay)
 
-        if needs_padding:
-            pad_amount = max_local_size - original_local_size
-            ndim = stacked_local.ndim
-            pad_spec = [0] * (2 * ndim)
-            pad_idx = 2 * (ndim - 1 - gather_dim)
-            pad_spec[pad_idx + 1] = pad_amount
-            stacked_local = torch.nn.functional.pad(stacked_local, pad_spec)
+                p_local.add_(ortho_local.to(dtype=p_local.dtype), alpha=-adjusted_lr)
+                # The AG-derived ``local_ortho_batch`` slice for index ``i``
+                # is last read here; once this iteration finishes for the
+                # highest ``i`` with grad, the buffer is safe to overwrite.
+                last_read = i
 
-        gather_list = [torch.empty_like(stacked_local) for _ in range(world_size)]
-        dist.all_gather(gather_list, stacked_local.contiguous(), group=pg)
-        del stacked_local
+            if instr:
+                apply_e.record()
+                stat["last_read_iter"] = int(last_read)
 
-        # Reconstruct full global tensor, stripping per-rank padding if needed.
-        remainder = global_dim_size % world_size
-        if remainder == 0:
-            stacked_full = torch.cat(gather_list, dim=gather_dim)
-        else:
-            real_chunks = []
-            for r in range(world_size):
-                real_size = max_local_size if r < remainder else (global_dim_size // world_size)
-                real_chunks.append(gather_list[r].narrow(gather_dim, 0, real_size))
-            stacked_full = torch.cat(real_chunks, dim=gather_dim)
-        del gather_list
-
-        # Phase 3: Batched Newton-Schulz
-        stacked_ortho = batched_newton_schulz(stacked_full, ns_coefficients, ns_steps, eps)
-        del stacked_full
-
-        # Phase 4: Local scatter + apply update
-        chunk_floor = global_dim_size // world_size
-        shard_start = rank * chunk_floor + min(rank, remainder)
-        local_ortho_batch = stacked_ortho.narrow(
-            gather_dim, shard_start, original_local_size
-        ).contiguous()
-        del stacked_ortho
-
-        for i, p in enumerate(params):
-            if not has_grad[i]:
-                continue
-            ortho_local = local_ortho_batch[i]
-            p_local = p.to_local() if isinstance(p, DTensor) else p
-
-            if weight_decay != 0.0:
-                p_local.mul_(1 - lr * weight_decay)
-
-            p_local.add_(ortho_local.to(dtype=p_local.dtype), alpha=-adjusted_lr)
+        if instr:
+            self._muon_stats.append(stat)
+            self._muon_events.append({
+                "pack_s": pack_s, "pack_e": pack_e,
+                "ag_s": ag_s, "ag_e": ag_e,
+                "ns_s": ns_s, "ns_e": ns_e,
+                "apply_s": apply_s, "apply_e": apply_e,
+            })
 
     @staticmethod
     def _compute_ortho(
