@@ -539,6 +539,18 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Whether or not to record the stack traces."},
     )
+    enable_teacher_fsdp_prefetch: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Overlap the FSDP2 root unshard (AllGather) with video_teacher_forward so "
+                "the main-forward-opening AllGather is hidden behind the teacher block. "
+                "Only effective when data_parallel_mode='fsdp2' AND "
+                "align_params.use_future_video=True; a no-op otherwise. Trainer captures "
+                "the FSDPModule reference BEFORE torch.compile() wraps the root model."
+            )
+        },
+    )
     max_steps: Optional[int] = field(
         default=None,
         metadata={"help": "Global max training steps. If None, train until all epochs are completed."},

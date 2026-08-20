@@ -403,7 +403,17 @@ def main():
             raise ValueError(f"Only MoRGBD depth distillation is supported, got {depth_model_type!r}.")
         depth_loss_weight = args.train.align_params.get("depth_loss_weight", 1.0)
         future_depth_loss_weight = args.train.align_params.get("future_depth_loss_weight", 1.0)
-        print('====Loading Depth Model====')
+        # Solver knob for MoGe's recover_focal_shift; default preserves the
+        # legacy scipy CPU L-M behaviour. Set to "gpu_lm" (batched linear init
+        # + 6-round LM on GPU) to remove the ~72 ms CPU stalls in
+        # depth_teacher_forward, or "gpu_linear" for the linear-only variant.
+        focal_shift_solver = args.train.align_params['depth'].get('focal_shift_solver', 'scipy')
+        if focal_shift_solver not in ('scipy', 'gpu_linear', 'gpu_lm'):
+            raise ValueError(
+                f"align_params.depth.focal_shift_solver must be one of "
+                f"'scipy' | 'gpu_linear' | 'gpu_lm', got {focal_shift_solver!r}"
+            )
+        print(f"====Loading Depth Model (focal_shift_solver={focal_shift_solver})====")
         moge_model, morgbd_model = build_depth_model(args.train.align_params)
         if args.train.use_compile:
             moge_model = torch.compile(moge_model)
@@ -489,6 +499,32 @@ def main():
         use_future_image=args.data.use_future_image,
     )
     logger.info_rank0(model)
+
+    # Capture the FSDP2 root FSDPModule reference BEFORE torch.compile wraps
+    # the model. torch.compile returns an OptimizedModule that does NOT expose
+    # FSDPModule.unshard(async_op=True); if we save the ref after compile we
+    # cannot launch the root AllGather asynchronously.
+    #
+    # Root-only unshard (non-recursive per PyTorch 2.8 FSDP2 docs) — only the
+    # root's own parameter group is all-gathered. Sub-block FSDPModules (each
+    # decoder layer, fused experts, etc.) keep their default lazy prefetch.
+    fsdp_prefetch_root = None
+    if (
+        args.train.enable_teacher_fsdp_prefetch
+        and args.train.data_parallel_mode == "fsdp2"
+    ):
+        if not hasattr(model, "unshard"):
+            raise RuntimeError(
+                "enable_teacher_fsdp_prefetch=True but the parallelized root "
+                "model does not expose FSDPModule.unshard(). Check that "
+                "data_parallel_mode='fsdp2' and build_parallelize_model called "
+                "fully_shard(model, ...)."
+            )
+        fsdp_prefetch_root = model
+        logger.info_rank0(
+            "enable_teacher_fsdp_prefetch=True: captured FSDP2 root for async "
+            "unshard overlap with video_teacher_forward."
+        )
 
     # Approach A: capture inner FSDPModules for the step-boundary manual reshard.
     # Capture MUST be post-compile — torch.compile returns an OptimizedModule and a
@@ -796,9 +832,27 @@ def main():
                         pil_images = micro_batch.pop('pil_images', None)
                         future_pil_images = micro_batch.pop('future_pil_images', None) if (use_future_depth or use_future_video) else None
                         with torch.autocast("cuda", dtype=torch.bfloat16):
-                            depth_targets, cls_token = get_depth_target(depth_model_type, (moge_model, morgbd_model), pil_images)
+                            depth_targets, cls_token = get_depth_target(
+                                depth_model_type,
+                                (moge_model, morgbd_model),
+                                pil_images,
+                                focal_shift_solver=focal_shift_solver,
+                            )
                             if use_future_depth:
-                                future_depth_targets, future_cls_token = get_depth_target(depth_model_type, (moge_model, morgbd_model), future_pil_images)
+                                future_depth_targets, future_cls_token = get_depth_target(
+                                    depth_model_type,
+                                    (moge_model, morgbd_model),
+                                    future_pil_images,
+                                    focal_shift_solver=focal_shift_solver,
+                                )
+                        # Overlap the root FSDP2 AllGather with video_teacher_forward.
+                        # Order is load-bearing: [depth] → [launch unshard] → [video] →
+                        # [wait] → [forward]. Launching after the video kernels collapses
+                        # the overlap.
+                        # Why: report/03_depth_teacher_and_allgather_prefetch/README.md 附录 A.3
+                        fsdp_prefetch_handle = None
+                        if fsdp_prefetch_root is not None and use_future_video:
+                            fsdp_prefetch_handle = fsdp_prefetch_root.unshard(async_op=True)
                         if use_future_video:
                             with torch.autocast("cuda", dtype=torch.bfloat16):
                                 future_video_target_bundle = get_video_target(
@@ -818,6 +872,8 @@ def main():
                                     future_video_targets = future_video_target_bundle
                             future_video_current_rgb = pil_images
                             future_video_target_rgb = future_pil_images
+                        if fsdp_prefetch_handle is not None:
+                            fsdp_prefetch_handle.wait()
                         depth_forward_time = time.time() - depth_start_time
 
                 with model_fwd_context:
