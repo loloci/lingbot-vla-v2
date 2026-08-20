@@ -489,8 +489,46 @@ def main():
         use_future_image=args.data.use_future_image,
     )
     logger.info_rank0(model)
+
+    # Approach A: capture inner FSDPModules for the step-boundary manual reshard.
+    # Capture MUST be post-compile — torch.compile returns an OptimizedModule and a
+    # pre-compile capture holds refs that are no longer the ones being trained.
+    # An empty list makes the reshard loop a no-op, so LINGBOT_CAPTURE_INNER_FSDP=0
+    # alone disables Approach A.
+    # Why: report/01_reshard_after_backward/README.md 附录 A.3
+    _capture_inner_fsdp = os.environ.get("LINGBOT_CAPTURE_INNER_FSDP", "1") != "0"
+    _inner_fsdp_modules: list = []
+    # Pairs with RAF=False in torch_parallelize.py; restores
+    # `module.weight is _sharded_param` at the step boundary so clip sees the right
+    # grads and the optimizer update propagates. Cost ~+170 ms/step, no communication.
+    # Opting out must be paired with LINGBOT_KEEP_RESHARD_AFTER_BACKWARD=1.
+    # Why: report/01_reshard_after_backward/README.md §3.2, 附录 A.3
+    _manual_reshard_step_boundary = os.environ.get("LINGBOT_MANUAL_STEP_RESHARD", "1") != "0"
+
     if args.train.use_compile:
         model = torch.compile(model)
+
+    # Post-compile capture: `model` may be an OptimizedModule, and Dynamo does not
+    # recurse into `_orig_mod` on `.modules()`, so walk it explicitly.
+    if _capture_inner_fsdp and args.train.data_parallel_mode == "fsdp2":
+        try:
+            from torch.distributed._composable.fsdp import FSDPModule as _FSDPModule
+            _walk_root = getattr(model, "_orig_mod", model)
+            for _m in _walk_root.modules():
+                if isinstance(_m, _FSDPModule) and _m is not _walk_root:
+                    _inner_fsdp_modules.append(_m)
+            logger.info_rank0(
+                f"Captured {len(_inner_fsdp_modules)} inner FSDPModules (post-compile) for "
+                f"step-boundary manual reshard (LINGBOT_MANUAL_STEP_RESHARD=1 to enable)."
+            )
+        except Exception as _e:
+            logger.warning_rank0(f"Failed to capture inner FSDPModules: {_e}")
+            _inner_fsdp_modules = []
+    elif not _capture_inner_fsdp:
+        logger.info_rank0(
+            "LINGBOT_CAPTURE_INNER_FSDP=0 → skipping inner-FSDPModule capture; "
+            "manual step-boundary reshard loop will be a no-op."
+        )
 
     moe_param_groups = get_moe_param_groups(model, args.train)
     if moe_param_groups is not None:
@@ -873,6 +911,13 @@ def main():
                 max_grad_norm = args.train.decayed_max_grad_norm
             else:
                 max_grad_norm = args.train.max_grad_norm
+            # Approach A: after all micro-batch backward hooks have fired, reshard every
+            # inner FSDPModule so `module.weight is _sharded_param` holds again before
+            # clip and before the next step's pre_forward AllGather.
+            # Why: report/01_reshard_after_backward/README.md §3.2, 附录 A.3
+            if _manual_reshard_step_boundary and _inner_fsdp_modules:
+                for _fsdp_m in _inner_fsdp_modules:
+                    _fsdp_m.reshard()
             if args.train.data_parallel_mode == "fsdp1":
                 grad_norm = model.clip_grad_norm_(max_grad_norm).item()
             elif hasattr(model, '_ep_param_set'):
