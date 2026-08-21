@@ -56,6 +56,35 @@ logger = logging.get_logger(__name__)
 # Why: report/01_reshard_after_backward/README.md §2-3, 附录 A.2
 _KEEP_RESHARD_AFTER_BACKWARD = os.environ.get("LINGBOT_KEEP_RESHARD_AFTER_BACKWARD", "0") == "1"
 
+def _wire_dualcall_forward_prefetch(model: "nn.Module", depth: int = 1) -> None:
+    """Chain forward prefetch along the real dual-call execution order.
+
+    QwenvlWithExpertV2Model.forward walks layer_idx and calls the VLM layer then
+    the expert layer, so the visit order is V0, E0, V1, E1, ... Each FSDPModule
+    prefetches the next `depth` AllGathers.
+    Why: report/06_fsdp2_forwardprefech_depth/README.md §2-3
+    """
+    from torch.distributed._composable.fsdp import FSDPModule
+
+    try:
+        root = getattr(model, "_orig_mod", model)
+        qwe = root.model.qwenvl_with_expert
+        vlm, exp = _resolve(qwe.qwenvl, [
+            ("model", "language_model", "layers"), ("model", "layers"),
+            ("language_model", "model", "layers"),
+        ])[0], qwe.qwen_expert.model.layers
+        if vlm is None:
+            logger.warning_rank0("prefetch: VLM layers not found, skipped.")
+            return
+        chain = [m for pair in zip(vlm, exp) for m in pair if isinstance(m, FSDPModule)]
+        for i, cur in enumerate(chain[:-1]):
+            cur.set_modules_to_forward_prefetch(chain[i + 1 : i + 1 + depth])
+        logger.info_rank0(
+            f"LINGBOT_FSDP2_PREFETCH={depth}: chained {len(chain)} FSDPModules (dual-call order)."
+        )
+    except Exception as e:
+        logger.warning_rank0(f"prefetch wiring failed: {e}")
+
 def _resolve(root: Any, paths: List[tuple[str, ...]]) -> tuple[Optional[Any], Optional[tuple[str, ...]]]:
     for path in paths:
         current = root
@@ -387,6 +416,15 @@ def build_parallelize_model(
                             layer.set_reshard_after_backward(enable_full_shard)
 
             fully_shard(model, **mp_fsdp_kwargs)
+
+            # Explicit forward prefetch across the dual-call order V0→E0→V1→E1→…
+            # (FSDP2 default depth is 1: pre_forward unshards then immediately waits,
+            # and that wait is pinned on an event recorded on the compute stream).
+            # Value = chain depth; 0 = off.
+            # Why: report/06_fsdp2_forwardprefech_depth/README.md §2-3
+            _pf_depth = int(os.environ.get("LINGBOT_FSDP2_PREFETCH", "0") or 0)
+            if _pf_depth > 0:
+                _wire_dualcall_forward_prefetch(model, _pf_depth)
 
             if kwargs.get("init_device") == "meta":
                 if weights_path is None:
