@@ -76,6 +76,49 @@ _DEFAULT_ADAMW_NAME_PATTERNS: Tuple[str, ...] = (
 
 _MEGABATCH_MAX_GROUP_SIZE = 32
 
+# AG/NS pipelining. Rationale + measured payoff table:
+# memory/experiments/plan-muon-p1a-260818.md
+_PIPELINE_DEPTH_ENV = "LINGBOT_MUON_PIPELINE_DEPTH"
+_CHUNK_ORDER_ENV = "LINGBOT_MUON_CHUNK_ORDER"
+_AG_BYTE_CAP_ENV = "LINGBOT_MUON_AG_BYTE_CAP"
+_AG_DTYPE_ENV = "LINGBOT_MUON_AG_DTYPE"
+
+# Newton-Schulz runs in this dtype no matter what it is handed; the AG downcast
+# below is only safe because it matches. Keep the two tied.
+NS_COMPUTE_DTYPE = torch.bfloat16
+
+
+def _pipeline_depth() -> int:
+    """AG chunks allowed in flight. 1 = legacy fully-serial path."""
+    try:
+        return max(1, int(os.environ.get(_PIPELINE_DEPTH_ENV, "2")))
+    except ValueError:
+        return 2
+
+
+def _chunk_order() -> str:
+    """``bytes_desc`` (default) or ``legacy`` (pre-260818 shape-key order)."""
+    return os.environ.get(_CHUNK_ORDER_ENV, "bytes_desc").strip().lower()
+
+
+def _ag_byte_cap() -> int:
+    """On-wire AG bytes allowed per chunk. 0 = count-based chunking only."""
+    try:
+        return max(0, int(os.environ.get(_AG_BYTE_CAP_ENV, "0")))
+    except ValueError:
+        return 0
+
+
+def _ag_dtype() -> Optional[torch.dtype]:
+    """Wire dtype for the Muon all-gather. ``None`` = keep the param dtype.
+
+    ``bf16`` is provably bitwise-identical: NS casts to bf16 on its first line,
+    and cast-then-cat == cat-then-cast (both elementwise). See
+    memory/experiments/exp-muon-ag-bf16-260819.md.
+    """
+    name = os.environ.get(_AG_DTYPE_ENV, "").strip().lower()
+    return {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16}.get(name)
+
 
 @torch.no_grad()
 def batched_newton_schulz(
@@ -196,18 +239,17 @@ _KIND_MOE_GATHER_3D = "moe_gather_3d"
 
 
 # --------------------------------------------------------------------------- #
-# Instrumentation: per-shape-group NVTX + metadata for the DistributedMuon
-# double-buffer redesign work (see memory/experiments/profile-analysis-260727).
+# Instrumentation: per-chunk NVTX + metadata for the DistributedMuon AG/NS
+# pipeline (see memory/experiments/plan-muon-p1a-260818.md).
 #
-# The synchronous baseline emits 5 NVTX ranges per shape-group chunk:
-#   muon_group/{i}   ..  full chunk (pack + AG + NS + apply)
+# 6 NVTX ranges per chunk:
+#   muon_group/{i}   ..  whole chunk (depth=1 only; depth>1 interleaves chunks)
 #     muon_pack/{i}  ..  Phase 1 momentum + Phase 2 stack/pad
-#     muon_ag/{i}    ..  dist.all_gather + reconstruction cat/narrow
+#     muon_ag/{i}    ..  all_gather ISSUE (returns immediately when async)
+#     muon_wait/{i}  ..  work.wait() + reconstruction cat/narrow == exposed AG
 #     muon_ns/{i}    ..  batched Newton-Schulz on the gathered tensor
 #     muon_apply/{i} ..  narrow-view scatter + per-param add_ into params
-# The END of `muon_apply/{i}` marks the last read of chunk i's AG-derived
-# buffer, i.e. the earliest safe point to reuse slot i in a future async
-# double-buffered scheduler.
+# The END of `muon_apply/{i}` is the last read of chunk i's AG-derived buffer.
 #
 # Chunk numbering (`{i}`) is monotonic across the whole `.step()` call and
 # identical on every rank, so multi-rank nsys traces align by chunk_idx.
@@ -364,7 +406,7 @@ class DistributedMuon(Optimizer):
         # ranges and per-chunk metadata are emitted. Effective enable = ctor
         # kwarg OR env var LINGBOT_MUON_PROFILE=1.
         self._enable_nvtx: bool = bool(enable_nvtx) or _muon_profile_enabled()
-        # Chunk-level metadata list, appended once per _step_megabatch_chunk
+        # Chunk-level metadata list, appended once per _megabatch_finish
         # call. Reset at the start of every step() so `.step_index` is
         # monotonic within a step and step-to-step comparisons are trivial.
         # Entries collect (in insertion / call order):
@@ -381,9 +423,12 @@ class DistributedMuon(Optimizer):
         #     "ag_in_bytes":       nbytes of the tensor handed to all_gather,
         #     "ag_out_bytes":      cumulative nbytes of gather_list buffers,
         #     "pack_ms":           Phase 1+early-Phase 2 CUDA elapsed_time,
-        #     "ag_ms":             Phase 2 AG + reconstruction elapsed_time,
+        #     "ag_ms":             AG issue -> AG complete (spans other chunks'
+        #                          compute when pipelined; NOT the exposed cost),
+        #     "wait_ms":           work.wait() -> AG complete == EXPOSED AG,
         #     "ns_ms":             Phase 3 batched NS elapsed_time,
         #     "apply_ms":          Phase 4 scatter+apply elapsed_time,
+        #     "pipeline_depth":    AG chunks allowed in flight (1 = serial),
         #     "last_read_iter":    Phase 4 last iter index that touched buffer,
         #   }
         # ``_muon_events`` holds the raw (start, end) event pairs; timings are
@@ -424,6 +469,10 @@ class DistributedMuon(Optimizer):
             stat["ag_ms"] = ev["ag_s"].elapsed_time(ev["ag_e"])
             stat["ns_ms"] = ev["ns_s"].elapsed_time(ev["ns_e"])
             stat["apply_ms"] = ev["apply_s"].elapsed_time(ev["apply_e"])
+            if "wait_s" in ev:
+                # Exposed AG time. Σwait_ms is the number the pipeline must
+                # shrink; Σag_ms cannot, since it now spans other chunks' NS.
+                stat["wait_ms"] = ev["wait_s"].elapsed_time(ev["wait_e"])
 
         payload = {
             "rank": int(rank),
@@ -505,9 +554,11 @@ class DistributedMuon(Optimizer):
                     other_params.append((p, kind))
 
             # --- Mega-batch path for FSDP_GATHER_2D ---
-            # Sort by key to guarantee identical ordering across all ranks.
-            for _key in sorted(fsdp_2d_groups.keys()):
-                self._step_megabatch(fsdp_2d_groups[_key], group_config)
+            # Flat chunk plan across all shape groups (largest AG first), run
+            # through a depth-N AG/NS pipeline. Order is derived from global
+            # shape/dtype/count only => identical collective order on all ranks.
+            plan = self._build_megabatch_plan(fsdp_2d_groups, group_config)
+            self._run_megabatch_pipeline(plan, group_config)
 
             # --- Per-param fallback for remaining kinds ---
             # Operate on local tensors to avoid DTensor dispatch issues
@@ -559,69 +610,119 @@ class DistributedMuon(Optimizer):
 
         return loss
 
-    def _step_megabatch(self, params: List[Tensor], config: dict) -> None:
-        """Process a batch of same-shape FSDP_GATHER_2D params with batched comms + NS."""
-        N = len(params)
-        if N == 0:
-            return
+    def _build_megabatch_plan(
+        self, fsdp_2d_groups: Dict[tuple, List[Tensor]], config: dict
+    ) -> List[Dict[str, Any]]:
+        """Flatten shape groups into chunks ordered by descending AG bytes.
 
-        momentum = config["momentum"]
-        nesterov = config["nesterov"]
-        ns_coefficients = config["ns_coefficients"]
-        ns_steps = config["ns_steps"]
-        eps = config["eps"]
-        lr = config["lr"]
-        weight_decay = config["weight_decay"]
-        adjust_lr_fn = config["adjust_lr_fn"]
-
-        pg, world_size, rank, shard_dim = _get_dtensor_shard_info(params[0])
-
-        # Compute adjusted_lr once (all params have same global shape)
-        lr_shape = params[0].shape[-2:]
-        adjusted_lr = _adjust_lr(lr, adjust_lr_fn, lr_shape)
-
-        # Process in sub-batches to bound peak memory.
-        # Emit ``muon_group/{i}`` as an umbrella range over each chunk so a
-        # nsys viewer can collapse a whole shape-group into a single block.
-        # Chunk index is grabbed BEFORE calling _step_megabatch_chunk (which
-        # bumps the counter) so the umbrella name matches the inner
-        # ``muon_pack/{i}`` / ``muon_ag/{i}`` etc. ranges.
-        for batch_start in range(0, N, _MEGABATCH_MAX_GROUP_SIZE):
-            batch_params = params[batch_start:batch_start + _MEGABATCH_MAX_GROUP_SIZE]
-            group_idx = self._muon_chunk_counter
-            with _MuonPerfRange(f"muon_group/{group_idx}", self._enable_nvtx):
-                self._step_megabatch_chunk(
-                    batch_params, momentum, nesterov, ns_coefficients, ns_steps,
-                    eps, lr, weight_decay, adjusted_lr, pg, world_size, rank, shard_dim,
-                )
-
-    def _step_megabatch_chunk(
-        self,
-        params: List[Tensor],
-        momentum: float,
-        nesterov: bool,
-        ns_coefficients: tuple,
-        ns_steps: int,
-        eps: float,
-        lr: float,
-        weight_decay: float,
-        adjusted_lr: float,
-        pg: Any,
-        world_size: int,
-        rank: int,
-        shard_dim: int,
-    ) -> None:
-        """Core mega-batch logic for a chunk of same-shape params.
-
-        Emits (when ``self._enable_nvtx``) 5 nested NVTX ranges per call:
-        ``muon_group/{i}`` > ``muon_pack/{i}`` / ``muon_ag/{i}`` /
-        ``muon_ns/{i}`` / ``muon_apply/{i}``. Records the chunk's shape,
-        dtype, AG in/out bytes, and per-phase CUDA elapsed times into
-        ``self._muon_stats`` / ``self._muon_events`` for offline diff against
-        the future double-buffered scheduler.
+        Sort keys are global metadata only (shape / dtype / count) => every rank
+        builds the identical list and issues the identical collective order.
+        Largest-first is load-bearing, not cosmetic: three chunks hold 52.4% of
+        the AG bytes and stall a shallow pipeline if left until the end.
+        See memory/experiments/plan-muon-p1a-260818.md.
         """
-        chunk_idx = self._muon_chunk_counter
-        self._muon_chunk_counter += 1
+        lr = config["lr"]
+        adjust_lr_fn = config["adjust_lr_fn"]
+        byte_cap = _ag_byte_cap()
+        wire_dtype = _ag_dtype()
+        plan: List[Dict[str, Any]] = []
+
+        for key_ord, _key in enumerate(sorted(fsdp_2d_groups.keys())):
+            params = fsdp_2d_groups[_key]
+            if not params:
+                continue
+            pg, world_size, rank, shard_dim = _get_dtensor_shard_info(params[0])
+            global_shape = tuple(params[0].shape)
+            max_local_size = (global_shape[shard_dim] + world_size - 1) // world_size
+            # Wire dtype, not param dtype: the cap is a millisecond budget in
+            # disguise (bytes / ring goodput), so it must count what is sent.
+            itemsize = (wire_dtype or params[0].dtype).itemsize
+            per_param = itemsize * max_local_size
+            for d, s in enumerate(global_shape):
+                if d != shard_dim:
+                    per_param *= s
+            adjusted_lr = _adjust_lr(lr, adjust_lr_fn, params[0].shape[-2:])
+
+            # P1b: cap the on-wire bytes per chunk so the three ~220 ms giants
+            # stop stalling a depth-2 pipeline. Sizes come from global metadata
+            # only => identical plan on every rank. 0 keeps the legacy count-only
+            # boundaries [32, 32, ..., rem] so cap=0 stays the E1 control exactly.
+            # Under a cap the params are spread evenly instead, but never down to
+            # a lone param: cuBLAS picks a different baddbmm kernel at batch==1,
+            # which breaks bitwise equality for some shapes
+            # (scripts/probe_baddbmm_batch1.py). The cap is therefore soft.
+            n = len(params)
+            if byte_cap:
+                gs = max(1, min(_MEGABATCH_MAX_GROUP_SIZE, byte_cap // (world_size * per_param)))
+                n_chunk = max(1, min((n + gs - 1) // gs, n // 2))
+                base, extra = divmod(n, n_chunk)
+                sizes = [base + (i < extra) for i in range(n_chunk)]
+            else:
+                sizes = [_MEGABATCH_MAX_GROUP_SIZE] * (n // _MEGABATCH_MAX_GROUP_SIZE)
+                if n % _MEGABATCH_MAX_GROUP_SIZE:
+                    sizes.append(n % _MEGABATCH_MAX_GROUP_SIZE)
+
+            start = 0
+            for pos, size in enumerate(sizes):
+                chunk = params[start:start + size]
+                start += size
+                plan.append({
+                    "params": chunk,
+                    "ag_bytes": world_size * len(chunk) * per_param,
+                    "tie": (key_ord, pos),
+                    "pg": pg,
+                    "world_size": world_size,
+                    "rank": rank,
+                    "shard_dim": shard_dim,
+                    "adjusted_lr": adjusted_lr,
+                })
+
+        if _chunk_order() != "legacy":
+            plan.sort(key=lambda e: (-e["ag_bytes"], e["tie"]))
+        return plan
+
+    def _run_megabatch_pipeline(self, plan: List[Dict[str, Any]], config: dict) -> None:
+        """Depth-N pipeline: chunk i+1's all-gather overlaps chunk i's NS.
+
+        ``async_op=True`` moves the AG onto ProcessGroupNCCL's comm stream;
+        with the default ``async_op=False`` torch>=2.7 runs it on the *current*
+        stream, which is why the baseline's 44 AGs share the compute stream and
+        overlap it by exactly 0.00 ms. ``work.wait()`` makes the compute stream
+        wait before NS reads the gathered buffer.
+        """
+        depth = _pipeline_depth()
+        inflight: List[Dict[str, Any]] = []
+
+        for entry in plan:
+            entry["chunk_idx"] = self._muon_chunk_counter
+            self._muon_chunk_counter += 1
+
+            if depth == 1:  # legacy fully-serial path, bit-identical schedule
+                with _MuonPerfRange(f"muon_group/{entry['chunk_idx']}", self._enable_nvtx):
+                    self._megabatch_issue(entry, config, depth)
+                    self._megabatch_finish(entry, config, depth)
+                continue
+
+            self._megabatch_issue(entry, config, depth)
+            inflight.append(entry)
+            if len(inflight) >= depth:
+                self._megabatch_finish(inflight.pop(0), config, depth)
+
+        while inflight:
+            self._megabatch_finish(inflight.pop(0), config, depth)
+
+    def _megabatch_issue(self, entry: Dict[str, Any], config: dict, depth: int) -> None:
+        """Phases 1-2 for one chunk: momentum + stack/pad, then launch the AG.
+
+        ``async_op=depth > 1`` is the whole point of P1a-ii: it puts the
+        all-gather on ProcessGroupNCCL's comm stream instead of the current
+        (compute) stream, which is what lets it overlap the previous chunk's
+        Newton-Schulz. Emits ``muon_pack/{i}`` + ``muon_ag/{i}``.
+        """
+        params = entry["params"]
+        world_size = entry["world_size"]
+        shard_dim = entry["shard_dim"]
+        chunk_idx = entry["chunk_idx"]
         instr = self._enable_nvtx
 
         # Per-chunk stats scaffold — filled progressively; timings resolved
@@ -638,29 +739,35 @@ class DistributedMuon(Optimizer):
             "max_local_size": 0,
             "ag_in_bytes": 0,
             "ag_out_bytes": 0,
+            "pipeline_depth": int(depth),
             "pack_ms": None,
             "ag_ms": None,
+            "wait_ms": None,
             "ns_ms": None,
             "apply_ms": None,
             "last_read_iter": -1,
         }
+        entry["stat"] = stat
+        ev: Dict[str, Any] = {}
+        entry["ev"] = ev
         if instr:
-            pack_s, pack_e = self._make_event_pair()
-            ag_s, ag_e = self._make_event_pair()
-            ns_s, ns_e = self._make_event_pair()
-            apply_s, apply_e = self._make_event_pair()
-
-        # NB: the outer ``muon_group/{i}`` range is opened by _step_megabatch
-        # (so multi-chunk shape groups get a single umbrella range on nsys).
-        # Here we only emit the four inner phases.
+            for _ph in ("pack", "ag", "ns", "apply"):
+                ev[f"{_ph}_s"], ev[f"{_ph}_e"] = self._make_event_pair()
+            # ``wait_ms`` = the EXPOSED part of the AG (wait_s -> AG complete).
+            # It is what must collapse when the pipeline works; ``ag_ms``
+            # (issue -> complete) also spans other chunks' compute by design.
+            ev["wait_s"] = torch.cuda.Event(enable_timing=True)
+            ev["wait_e"] = ev["ag_e"]
 
         with _MuonPerfRange(f"muon_pack/{chunk_idx}", instr):
             if instr:
-                pack_s.record()
+                ev["pack_s"].record()
             # Phase 1: Momentum update on LOCAL tensors (no DTensor ops).
             # This avoids issues with torch.compile which may produce non-DTensor grads.
             # Params with grad=None contribute zeros (they must still participate in
             # the collective to keep all ranks in sync).
+            momentum = config["momentum"]
+            nesterov = config["nesterov"]
             local_updates: List[Tensor] = []
             has_grad: List[bool] = []
             for p in params:
@@ -692,6 +799,12 @@ class DistributedMuon(Optimizer):
             stacked_local = torch.stack(local_updates, dim=0)  # [N, local_M, K]
             del local_updates
 
+            # Downcast the wire payload. Bitwise-safe: NS's first act is the same
+            # cast, and cast/cat/pad-with-zeros all commute elementwise.
+            wire_dtype = _ag_dtype()
+            if wire_dtype is not None and stacked_local.dtype != wire_dtype:
+                stacked_local = stacked_local.to(wire_dtype)
+
             gather_dim = shard_dim + 1  # +1 for the batch dim we prepended
             original_local_size = stacked_local.size(gather_dim)
 
@@ -711,14 +824,14 @@ class DistributedMuon(Optimizer):
                 stacked_local = torch.nn.functional.pad(stacked_local, pad_spec)
 
             if instr:
-                pack_e.record()
+                ev["pack_e"].record()
                 stat["with_grad_count"] = int(sum(has_grad))
                 stat["local_size"] = int(original_local_size)
                 stat["max_local_size"] = int(max_local_size)
 
         with _MuonPerfRange(f"muon_ag/{chunk_idx}", instr):
             if instr:
-                ag_s.record()
+                ev["ag_s"].record()
             gather_list = [torch.empty_like(stacked_local) for _ in range(world_size)]
             if instr:
                 stat["ag_in_bytes"] = int(stacked_local.numel() * stacked_local.element_size())
@@ -727,9 +840,52 @@ class DistributedMuon(Optimizer):
                 stat["ag_out_bytes"] = int(
                     world_size * stacked_local.numel() * stacked_local.element_size()
                 )
-            dist.all_gather(gather_list, stacked_local.contiguous(), group=pg)
-            del stacked_local
+            stacked_local = stacked_local.contiguous()
+            work = dist.all_gather(
+                gather_list, stacked_local, group=entry["pg"], async_op=depth > 1
+            )
 
+        # Handed to _megabatch_finish; ``stacked_local`` must stay alive until
+        # the AG completes, so it is kept referenced here rather than deleted.
+        entry.update({
+            "work": work,
+            "gather_list": gather_list,
+            "stacked_local": stacked_local,
+            "has_grad": has_grad,
+            "gather_dim": gather_dim,
+            "original_local_size": original_local_size,
+            "max_local_size": max_local_size,
+            "global_dim_size": global_dim_size,
+        })
+
+    def _megabatch_finish(self, entry: Dict[str, Any], config: dict, depth: int) -> None:
+        """Wait for the chunk's AG, then Phases 3-4 (NS + scatter/apply).
+
+        ``work.wait()`` only makes the current stream wait on the comm stream;
+        it does not block the CPU, so the next chunk's AG is already in flight.
+        Emits ``muon_ns/{i}`` + ``muon_apply/{i}``.
+        """
+        params = entry["params"]
+        world_size = entry["world_size"]
+        chunk_idx = entry["chunk_idx"]
+        stat, ev = entry["stat"], entry["ev"]
+        instr = self._enable_nvtx
+        gather_dim = entry["gather_dim"]
+        global_dim_size = entry["global_dim_size"]
+        max_local_size = entry["max_local_size"]
+        original_local_size = entry["original_local_size"]
+        has_grad = entry["has_grad"]
+
+        with _MuonPerfRange(f"muon_wait/{chunk_idx}", instr):
+            if instr:
+                ev["wait_s"].record()
+            if entry["work"] is not None:
+                entry["work"].wait()
+            entry["work"] = None
+            entry["stacked_local"] = None  # AG done => input buffer reusable
+
+            gather_list = entry["gather_list"]
+            entry["gather_list"] = None
             # Reconstruct full global tensor, stripping per-rank padding if needed.
             remainder = global_dim_size % world_size
             if remainder == 0:
@@ -742,23 +898,28 @@ class DistributedMuon(Optimizer):
                 stacked_full = torch.cat(real_chunks, dim=gather_dim)
             del gather_list
             if instr:
-                ag_e.record()
+                ev["ag_e"].record()
 
         with _MuonPerfRange(f"muon_ns/{chunk_idx}", instr):
             if instr:
-                ns_s.record()
+                ev["ns_s"].record()
             # Phase 3: Batched Newton-Schulz
-            stacked_ortho = batched_newton_schulz(stacked_full, ns_coefficients, ns_steps, eps)
+            stacked_ortho = batched_newton_schulz(
+                stacked_full, config["ns_coefficients"], config["ns_steps"], config["eps"]
+            )
             del stacked_full
             if instr:
-                ns_e.record()
+                ev["ns_e"].record()
 
         with _MuonPerfRange(f"muon_apply/{chunk_idx}", instr):
             if instr:
-                apply_s.record()
+                ev["apply_s"].record()
             # Phase 4: Local scatter + apply update
+            lr = config["lr"]
+            weight_decay = config["weight_decay"]
+            adjusted_lr = entry["adjusted_lr"]
             chunk_floor = global_dim_size // world_size
-            shard_start = rank * chunk_floor + min(rank, remainder)
+            shard_start = entry["rank"] * chunk_floor + min(entry["rank"], remainder)
             local_ortho_batch = stacked_ortho.narrow(
                 gather_dim, shard_start, original_local_size
             ).contiguous()
@@ -781,17 +942,13 @@ class DistributedMuon(Optimizer):
                 last_read = i
 
             if instr:
-                apply_e.record()
+                ev["apply_e"].record()
                 stat["last_read_iter"] = int(last_read)
 
+        entry["params"] = None
         if instr:
             self._muon_stats.append(stat)
-            self._muon_events.append({
-                "pack_s": pack_s, "pack_e": pack_e,
-                "ag_s": ag_s, "ag_e": ag_e,
-                "ns_s": ns_s, "ns_e": ns_e,
-                "apply_s": apply_s, "apply_e": apply_e,
-            })
+            self._muon_events.append(ev)
 
     @staticmethod
     def _compute_ortho(
