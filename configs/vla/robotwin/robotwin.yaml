@@ -52,6 +52,9 @@ train:
   data_parallel_mode: fsdp2
   enable_full_shard: false
   module_fsdp_enable: true
+  # Hides the ~142 ms first root AllGather behind the gradient-free video teacher
+  # forward. See report/03_depth_teacher_and_allgather_prefetch/README.md
+  enable_teacher_fsdp_prefetch: true
   use_compile: true
   use_wandb: false
   rmpad: false
@@ -89,6 +92,10 @@ train:
       model_type: MoRGBD
       moge_path: /path/to/depth/moge2-vitb-normal.pt
       morgbd_path: /path/to/depth/model.pt
+      # Batched GPU Levenberg-Marquardt instead of the 144 ms scipy CPU loop.
+      # 'gpu_linear' is 3x faster again but 400x looser (8.4e-5 vs 2.0e-7).
+      # See report/03_depth_teacher_and_allgather_prefetch/README.md
+      focal_shift_solver: gpu_lm
       num_layers: 1
       num_heads: 4
       dim_head: 32
