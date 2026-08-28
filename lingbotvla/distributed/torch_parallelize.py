@@ -38,6 +38,7 @@ from .fsdp import (
     parallel_load_safetensors,
     register_checkpoint_extension,
 )
+from .fsdp2_rs_pipeline import maybe_patch_reduce_scatter_pipeline
 from .parallel_state import get_parallel_state
 from .utils import get_module_from_path, set_module_from_path
 
@@ -438,6 +439,11 @@ def build_parallelize_model(
             _pf_depth = int(os.environ.get("LINGBOT_FSDP2_PREFETCH", "0") or 0)
             if _pf_depth > 0:
                 _wire_dualcall_forward_prefetch(model, _pf_depth)
+
+            # backward RS pipeline depth. Patches FSDP2 class methods, so it only
+            # has to land before the first backward. Default 1 = torch untouched.
+            # Why: report/07_fsdp2_reduce_scatter_bf16/README.md §7（判不采纳）
+            maybe_patch_reduce_scatter_pipeline()
 
             if kwargs.get("init_device") == "meta":
                 if weights_path is None:
