@@ -24,6 +24,17 @@ export LINGBOT_MUON_AG_BYTE_CAP=${LINGBOT_MUON_AG_BYTE_CAP-700000000}
 export LINGBOT_MUON_AG_DTYPE=${LINGBOT_MUON_AG_DTYPE-bf16}
 export LINGBOT_FSDP2_PREFETCH=${LINGBOT_FSDP2_PREFETCH-2}
 
+# report/07 (§3 §9), report/08 (§3 §9), report/09 (§0). Same `${VAR-}` rule.
+# Rollback / A-B cells, set them in the invoking environment:
+#   LINGBOT_FSDP2_REDUCE_DTYPE=fp32     upcast bf16 grads before the RS (2x bytes)
+#   LINGBOT_VISUAL_ROTPOS_CACHE=0       recompute rot_pos_emb every step
+#   LINGBOT_VISUAL_POSEMB_CACHE=0       recompute the interpolation plan every step
+#   LINGBOT_MUON_NS_SHARD=0             replicated NS (every rank runs every NS)
+export LINGBOT_FSDP2_REDUCE_DTYPE=${LINGBOT_FSDP2_REDUCE_DTYPE-bf16}
+export LINGBOT_VISUAL_ROTPOS_CACHE=${LINGBOT_VISUAL_ROTPOS_CACHE-1}
+export LINGBOT_VISUAL_POSEMB_CACHE=${LINGBOT_VISUAL_POSEMB_CACHE-1}
+export LINGBOT_MUON_NS_SHARD=${LINGBOT_MUON_NS_SHARD-1}
+
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
   NPROC_PER_NODE=$(nvidia-smi -L | wc -l)
 else
