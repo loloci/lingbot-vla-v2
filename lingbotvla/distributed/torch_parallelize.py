@@ -429,6 +429,22 @@ def build_parallelize_model(
                         if not _KEEP_RESHARD_AFTER_BACKWARD:
                             layer.set_reshard_after_backward(enable_full_shard)
 
+            # 24 个 ViT block 没有被单独 wrap ⇒ 它们留在 root 的 param group 里，
+            # 这就是根 unshard AllGather 有 1911 MB / 280 ms 的原因。单独 shard 它们
+            # 能把那一坨拆开，代价是多 24 个 AG 的启动延迟。
+            # ⚠️ 探索性，未测过 A/B，默认关。
+            if os.environ.get("LINGBOT_FSDP2_WRAP_VISION_BLOCKS", "0") == "1":
+                try:
+                    vblocks = model.model.qwenvl_with_expert.qwenvl.visual.blocks
+                    for block in vblocks:
+                        fully_shard(block, **mp_fsdp_kwargs)
+                        # See dual-call rationale on set_reshard_after_backward above.
+                        if not _KEEP_RESHARD_AFTER_BACKWARD:
+                            block.set_reshard_after_backward(enable_full_shard)
+                    logger.info_rank0(f"LINGBOT_FSDP2_WRAP_VISION_BLOCKS=1: sharded {len(vblocks)} vision blocks.")
+                except Exception as e:
+                    logger.warning_rank0(f"vision block wrapping failed: {e}")
+
             fully_shard(model, **mp_fsdp_kwargs)
 
             # Explicit forward prefetch across the dual-call order V0→E0→V1→E1→…
@@ -439,6 +455,12 @@ def build_parallelize_model(
             _pf_depth = int(os.environ.get("LINGBOT_FSDP2_PREFETCH", "0") or 0)
             if _pf_depth > 0:
                 _wire_dualcall_forward_prefetch(model, _pf_depth)
+
+            # 让 unshard 的 all_gather 走 async_op=True。⚠️ 探索性，未测过 A/B，默认关；
+            # torch 2.8.0 的 FSDPModule 未必有这个私有方法，所以 hasattr 保护。
+            if os.environ.get("LINGBOT_FSDP2_ASYNC_UNSHARD", "0") == "1" and hasattr(model, "_set_unshard_async_op"):
+                model._set_unshard_async_op(True)
+                logger.info_rank0("LINGBOT_FSDP2_ASYNC_UNSHARD=1: unshard async_op enabled.")
 
             # backward RS pipeline depth. Patches FSDP2 class methods, so it only
             # has to land before the first backward. Default 1 = torch untouched.
