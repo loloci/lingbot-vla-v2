@@ -83,6 +83,11 @@ _CHUNK_ORDER_ENV = "LINGBOT_MUON_CHUNK_ORDER"
 _AG_BYTE_CAP_ENV = "LINGBOT_MUON_AG_BYTE_CAP"
 _AG_DTYPE_ENV = "LINGBOT_MUON_AG_DTYPE"
 
+# Newton-Schulz sharded to chunk owners. 0 = off (every rank runs every NS).
+# Rounds, mechanism and the measured p2p bandwidth law:
+# report/_docs/muon_ns_shard_a2a_proposal.md, memory/.../exp-muon-ns-a2a-*.md
+_NS_SHARD_ENV = "LINGBOT_MUON_NS_SHARD"
+
 # Newton-Schulz runs in this dtype no matter what it is handed; the AG downcast
 # below is only safe because it matches. Keep the two tied.
 NS_COMPUTE_DTYPE = torch.bfloat16
@@ -118,6 +123,27 @@ def _ag_dtype() -> Optional[torch.dtype]:
     """
     name = os.environ.get(_AG_DTYPE_ENV, "").strip().lower()
     return {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16}.get(name)
+
+
+def _ns_shard_rounds() -> int:
+    """Number of owner-exchange rounds per step. 0 = replicated NS (legacy)."""
+    try:
+        return max(0, int(os.environ.get(_NS_SHARD_ENV, "0")))
+    except ValueError:
+        return 0
+
+
+def _ns_cost(shape: tuple, count: int) -> float:
+    """Relative NS cost of a chunk, from global metadata only.
+
+    NS transposes to M <= K, then does 3 matmuls per step on [B, M, K]:
+    flops ~ 2*B*M^2*(2K + M).  Bytes are 2*B*M*K, so cost per byte scales with
+    the SHORT edge -- measured spread across production shapes is 5.4x, which is
+    why ``ag_bytes`` (a comm ordering) is the wrong key for balancing NS.
+    """
+    rows, cols = (shape + (1, 1))[:2] if len(shape) < 2 else shape[-2:]
+    m, k = min(rows, cols), max(rows, cols)
+    return float(count) * m * m * (2 * k + m)
 
 
 @torch.no_grad()
@@ -693,6 +719,21 @@ class DistributedMuon(Optimizer):
         depth = _pipeline_depth()
         inflight: List[Dict[str, Any]] = []
 
+        # NS sharded to chunk owners: one NS per chunk instead of world_size
+        # identical ones. Needs a power-of-two world size (the xor schedule is
+        # only a perfect matching there); otherwise fall through to the AG path.
+        rounds = _ns_shard_rounds()
+        if rounds and plan:
+            ws = plan[0]["world_size"]
+            if ws > 1 and ws & (ws - 1) == 0:
+                if not getattr(self, "_ns_shard_logged", False):
+                    self._ns_shard_logged = True
+                    if plan[0]["rank"] == 0:
+                        print(f"[muon] NS_SHARD=1: rounds={rounds} chunks={len(plan)} "
+                              f"ws={ws}, staged xor p2p replaces the all-gather", flush=True)
+                self._run_ns_shard_pipeline(plan, config, rounds)
+                return
+
         for entry in plan:
             entry["chunk_idx"] = self._muon_chunk_counter
             self._muon_chunk_counter += 1
@@ -710,6 +751,275 @@ class DistributedMuon(Optimizer):
 
         while inflight:
             self._megabatch_finish(inflight.pop(0), config, depth)
+
+    @staticmethod
+    def _shard_span(global_dim_size: int, world_size: int, rank: int) -> Tuple[int, int]:
+        """``(start, size)`` of ``rank``'s slice, matching FSDP2's own split.
+
+        Global metadata only, so a chunk owner can cut every rank's slice out of
+        one ortho tensor without asking anybody -- but it must be the SAME split
+        FSDP2 used: ``_chunk_with_empty`` = ``torch.chunk`` + empty tail
+        (``torch/distributed/fsdp/_fully_shard/_fsdp_common.py:121``), i.e.
+        ceil-sized pieces front-loaded and tail ranks possibly empty.  A balanced
+        floor+remainder split agrees only while every rank stays non-empty: the
+        [55, 768] family matches at ws=8 and splits 4x13,3,0,0 vs 4x7,3x9 at
+        ws=16.  See memory/experiments/exp-muon-ns-shard-2n-hang-260828.md.
+        """
+        chunk = -(-global_dim_size // world_size)
+        start = min(rank * chunk, global_dim_size)
+        return start, min(chunk, global_dim_size - start)
+
+    def _apply_ortho(
+        self, entry: Dict[str, Any], local_ortho_batch: Tensor,
+        has_grad: List[bool], config: dict,
+    ) -> int:
+        """Phase 4: weight decay + ``p -= lr * ortho`` on this rank's slice."""
+        lr = config["lr"]
+        weight_decay = config["weight_decay"]
+        adjusted_lr = entry["adjusted_lr"]
+        last_read = -1
+        for i, p in enumerate(entry["params"]):
+            if not has_grad[i]:
+                continue
+            p_local = p.to_local() if isinstance(p, DTensor) else p
+            if weight_decay != 0.0:
+                p_local.mul_(1 - lr * weight_decay)
+            p_local.add_(local_ortho_batch[i].to(dtype=p_local.dtype), alpha=-adjusted_lr)
+            # Slice ``i`` is last read here; after the highest ``i`` with a grad
+            # the buffer is safe to overwrite.
+            last_read = i
+        return last_read
+
+    def _pack_local(self, entry: Dict[str, Any], config: dict) -> Dict[str, Any]:
+        """Phases 1-2 for one chunk: momentum, stack, wire cast, pad to max_local.
+
+        Produces the payload both distribution paths send (all_gather, or the
+        owner exchange) plus the metadata needed to undo the padding. Params with
+        ``grad=None`` contribute zeros so every rank stays in the collective.
+        """
+        params = entry["params"]
+        world_size = entry["world_size"]
+        shard_dim = entry["shard_dim"]
+        momentum = config["momentum"]
+        nesterov = config["nesterov"]
+
+        # Momentum on LOCAL tensors: DTensor ops here break under torch.compile,
+        # which may hand back plain tensors as grads.
+        local_updates: List[Tensor] = []
+        has_grad: List[bool] = []
+        for p in params:
+            if p.grad is None:
+                p_local = p.to_local() if isinstance(p, DTensor) else p
+                local_updates.append(torch.zeros_like(p_local))
+                has_grad.append(False)
+                continue
+
+            has_grad.append(True)
+            state = self.state[p]
+            if "momentum_buffer" not in state:
+                state["momentum_buffer"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+            buf = state["momentum_buffer"]
+
+            buf_local = buf.to_local() if isinstance(buf, DTensor) else buf
+            grad_local = p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad
+
+            buf_local.lerp_(grad_local, 1 - momentum)
+            if nesterov:
+                update_local = grad_local.lerp(buf_local, momentum)
+            else:
+                update_local = buf_local.clone()
+
+            local_updates.append(update_local)
+
+        stacked_local = torch.stack(local_updates, dim=0)  # [N, local_M, K]
+        del local_updates
+
+        # Downcast the wire payload. Bitwise-safe: NS's first act is the same
+        # cast, and cast/cat/pad-with-zeros all commute elementwise.
+        wire_dtype = _ag_dtype()
+        if wire_dtype is not None and stacked_local.dtype != wire_dtype:
+            stacked_local = stacked_local.to(wire_dtype)
+
+        gather_dim = shard_dim + 1  # +1 for the batch dim we prepended
+        original_local_size = stacked_local.size(gather_dim)
+
+        # FSDP2 contiguous chunking may give different ranks different local sizes
+        # (ceil vs floor when global_dim % world_size != 0), while both dist
+        # collectives and the peer exchange want uniform pieces. Pad first.
+        global_dim_size = params[0].shape[shard_dim]  # DTensor .shape = global
+        max_local_size = (global_dim_size + world_size - 1) // world_size
+        if max_local_size != original_local_size:
+            pad_amount = max_local_size - original_local_size
+            ndim = stacked_local.ndim
+            pad_spec = [0] * (2 * ndim)
+            pad_spec[2 * (ndim - 1 - gather_dim) + 1] = pad_amount
+            stacked_local = torch.nn.functional.pad(stacked_local, pad_spec)
+
+        return {
+            "stacked_local": stacked_local,
+            "has_grad": has_grad,
+            "gather_dim": gather_dim,
+            "original_local_size": original_local_size,
+            "max_local_size": max_local_size,
+            "global_dim_size": global_dim_size,
+        }
+
+    @staticmethod
+    def _build_ns_rounds(
+        plan: List[Dict[str, Any]], world_size: int, rounds: int
+    ) -> List[List[List[Dict[str, Any]]]]:
+        """LPT the chunks into ``rounds x world_size`` bins; bin (r, o) = owner o.
+
+        Balanced on NS cost, NOT on ``ag_bytes``: after the internal transpose to
+        M <= K, NS does 3 matmuls on [B, M, K] per step, so cost/byte scales with
+        the short edge and the production shapes spread 5.4x.  Ownership is per
+        WHOLE chunk -- splitting one would change the ``baddbmm`` batch dim and
+        cuBLAS switches kernels at batch==1, the one thing that breaks bitwise
+        equality.  Metadata-only => every rank builds the identical assignment.
+        """
+        nbin = rounds * world_size
+        bins: List[List[Dict[str, Any]]] = [[] for _ in range(nbin)]
+        loads = [0.0] * nbin
+        for e in sorted(plan, key=lambda e: (-e["ns_cost"], e["tie"])):
+            b = min(range(nbin), key=lambda j: (loads[j], j))
+            bins[b].append(e)
+            loads[b] += e["ns_cost"]
+        return [bins[r * world_size:(r + 1) * world_size] for r in range(rounds)]
+
+    @staticmethod
+    def _staged_p2p(build, world_size: int, rank: int) -> None:
+        """Run ``build(peer)``'s p2p ops one xor matching at a time.
+
+        At step k every rank pairs with ``rank ^ k`` -- a perfect matching for
+        k = 1..ws-1 when ws is a power of two, so ws/2 disjoint pairs move at once
+        and no two pairs share a link.  Staying serial is load-bearing, not
+        conservative.  Measured on this node (zero NVLink, every hop through the
+        PCIe root complex), same volume each time:
+            1 matching in flight   15.9 GB/s      2 in flight   1.79 GB/s
+            all_to_all_single       1.20 GB/s     ring all_gather  12.0 GB/s
+        i.e. concurrency collapses it, not topology, and any batched or collective
+        form of this traffic is 8-13x slower than the ring it replaces.
+        Payloads must stay 16-byte aligned (4-byte alignment costs exactly 2x);
+        production trailing dims are all multiples of 8, so this holds by itself.
+        See memory/experiments/exp-muon-ns-a2a-*.md, scripts/probe_a2a_align.py.
+        """
+        for k in range(1, world_size):
+            # Empty slices exist once a tail rank gets nothing from torch.chunk;
+            # both sides size them from the same global metadata, so dropping the
+            # 0-element ops keeps the two op lists matched.
+            ops = [o for o in build(rank ^ k) if o.tensor.numel()]
+            if ops:
+                for work in dist.batch_isend_irecv(ops):
+                    work.wait()
+
+    @classmethod
+    def _cat_shards(
+        cls, shards: List[Tensor], gather_dim: int, global_dim_size: int, world_size: int
+    ) -> Tensor:
+        """Rank-ordered concat of ws padded shards, per-rank padding stripped."""
+        if global_dim_size % world_size == 0:
+            return torch.cat(shards, dim=gather_dim)
+        real = [
+            s.narrow(gather_dim, 0, cls._shard_span(global_dim_size, world_size, r)[1])
+            for r, s in enumerate(shards)
+        ]
+        return torch.cat(real, dim=gather_dim)
+
+    def _run_ns_shard_pipeline(
+        self, plan: List[Dict[str, Any]], config: dict, rounds: int
+    ) -> None:
+        """One Newton-Schulz per chunk instead of ``world_size`` identical copies.
+
+        Today every rank all-gathers every chunk and runs the same NS on it, so
+        (ws-1)/ws of that compute is thrown away.  Here each chunk gets one owner:
+        the shards travel to the owner, the owner runs NS once, the ws output
+        slices travel back.  Both hops use the staged xor exchange (_staged_p2p),
+        which is the only p2p pattern that beats the ring on this node.
+        Bit-identical to the all-gather path: p2p moves bytes, the ``cat`` is still
+        in rank order, NS is untouched, and the slice bounds come from the same
+        global metadata as today's ``narrow``.
+        Design + measurements: report/_docs/muon_ns_shard_a2a_proposal.md.
+        """
+        instr = self._enable_nvtx
+        pg, world_size, rank = plan[0]["pg"], plan[0]["world_size"], plan[0]["rank"]
+        for e in plan:
+            if (e["pg"], e["world_size"], e["rank"]) != (pg, world_size, rank):
+                raise RuntimeError("NS sharding needs one process group for the step")
+            e["ns_cost"] = _ns_cost(tuple(e["params"][0].shape), len(e["params"]))
+            e["chunk_idx"] = self._muon_chunk_counter
+            self._muon_chunk_counter += 1
+        gp = ([dist.get_global_rank(pg, r) for r in range(world_size)]
+              if pg is not None else list(range(world_size)))
+
+        for r_idx, owners in enumerate(self._build_ns_rounds(plan, world_size, rounds)):
+            mine, flat = owners[rank], []
+            for o, row in enumerate(owners):
+                for e in row:
+                    e["owner"] = o
+                    flat.append(e)
+
+            with _MuonPerfRange(f"muon_ns_pack/{r_idx}", instr):
+                for e in flat:
+                    e["pk"] = pk = self._pack_local(e, config)
+                    sl = pk["stacked_local"] = pk["stacked_local"].contiguous()
+                    if e["owner"] == rank:
+                        e["gl"] = [sl if r == rank else torch.empty_like(sl)
+                                   for r in range(world_size)]
+                    else:
+                        # my slice of the ortho comes back unpadded
+                        shape = list(sl.shape)
+                        shape[pk["gather_dim"]] = pk["original_local_size"]
+                        e["rb"] = torch.empty(shape, dtype=sl.dtype, device=sl.device)
+
+            # -> owner: my shard of every chunk it owns, its shard of every chunk
+            #    I own.  Both sides walk the same owner list, so the isend/irecv
+            #    order matches without any extra handshake.
+            with _MuonPerfRange(f"muon_ns_a2a_fwd/{r_idx}", instr):
+                self._staged_p2p(
+                    lambda peer: (
+                        [dist.P2POp(dist.isend, e["pk"]["stacked_local"], gp[peer], pg)
+                         for e in owners[peer]]
+                        + [dist.P2POp(dist.irecv, e["gl"][peer], gp[peer], pg) for e in mine]
+                    ),
+                    world_size, rank,
+                )
+            for e in flat:
+                if e["owner"] != rank:
+                    e["pk"]["stacked_local"] = None      # sent, buffer reusable
+
+            with _MuonPerfRange(f"muon_ns_compute/{r_idx}", instr):
+                for e in mine:
+                    pk = e["pk"]
+                    full = self._cat_shards(
+                        e["gl"], pk["gather_dim"], pk["global_dim_size"], world_size
+                    )
+                    e["gl"], pk["stacked_local"] = None, None
+                    ortho = batched_newton_schulz(
+                        full, config["ns_coefficients"], config["ns_steps"], config["eps"]
+                    )
+                    del full
+                    e["sl"] = [
+                        ortho.narrow(pk["gather_dim"],
+                                     *self._shard_span(pk["global_dim_size"], world_size, r)
+                                     ).contiguous()
+                        for r in range(world_size)
+                    ]
+                    del ortho
+
+            with _MuonPerfRange(f"muon_ns_a2a_rev/{r_idx}", instr):
+                self._staged_p2p(
+                    lambda peer: (
+                        [dist.P2POp(dist.isend, e["sl"][peer], gp[peer], pg) for e in mine]
+                        + [dist.P2POp(dist.irecv, e["rb"], gp[peer], pg) for e in owners[peer]]
+                    ),
+                    world_size, rank,
+                )
+
+            with _MuonPerfRange(f"muon_ns_apply/{r_idx}", instr):
+                for e in flat:
+                    lob = e["sl"][rank] if e["owner"] == rank else e["rb"]
+                    self._apply_ortho(e, lob, e["pk"]["has_grad"], config)
+                    e["params"] = e["pk"] = e["sl"] = e["rb"] = None
 
     def _megabatch_issue(self, entry: Dict[str, Any], config: dict, depth: int) -> None:
         """Phases 1-2 for one chunk: momentum + stack/pad, then launch the AG.
@@ -762,67 +1072,13 @@ class DistributedMuon(Optimizer):
         with _MuonPerfRange(f"muon_pack/{chunk_idx}", instr):
             if instr:
                 ev["pack_s"].record()
-            # Phase 1: Momentum update on LOCAL tensors (no DTensor ops).
-            # This avoids issues with torch.compile which may produce non-DTensor grads.
-            # Params with grad=None contribute zeros (they must still participate in
-            # the collective to keep all ranks in sync).
-            momentum = config["momentum"]
-            nesterov = config["nesterov"]
-            local_updates: List[Tensor] = []
-            has_grad: List[bool] = []
-            for p in params:
-                if p.grad is None:
-                    # No grad — contribute zeros to the collective
-                    p_local = p.to_local() if isinstance(p, DTensor) else p
-                    local_updates.append(torch.zeros_like(p_local))
-                    has_grad.append(False)
-                    continue
-
-                has_grad.append(True)
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                buf = state["momentum_buffer"]
-
-                buf_local = buf.to_local() if isinstance(buf, DTensor) else buf
-                grad_local = p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad
-
-                buf_local.lerp_(grad_local, 1 - momentum)
-                if nesterov:
-                    update_local = grad_local.lerp(buf_local, momentum)
-                else:
-                    update_local = buf_local.clone()
-
-                local_updates.append(update_local)
-
-            # Phase 2 (pack half): Stack local updates.
-            stacked_local = torch.stack(local_updates, dim=0)  # [N, local_M, K]
-            del local_updates
-
-            # Downcast the wire payload. Bitwise-safe: NS's first act is the same
-            # cast, and cast/cat/pad-with-zeros all commute elementwise.
-            wire_dtype = _ag_dtype()
-            if wire_dtype is not None and stacked_local.dtype != wire_dtype:
-                stacked_local = stacked_local.to(wire_dtype)
-
-            gather_dim = shard_dim + 1  # +1 for the batch dim we prepended
-            original_local_size = stacked_local.size(gather_dim)
-
-            # FSDP2 contiguous chunking may give different ranks different local sizes
-            # (ceil vs floor when global_dim % world_size != 0). dist.all_gather
-            # requires uniform sizes. Pad to max_local_size before gathering.
-            global_dim_size = params[0].shape[shard_dim]  # DTensor .shape = global
-            max_local_size = (global_dim_size + world_size - 1) // world_size
-            needs_padding = (max_local_size != original_local_size)
-
-            if needs_padding:
-                pad_amount = max_local_size - original_local_size
-                ndim = stacked_local.ndim
-                pad_spec = [0] * (2 * ndim)
-                pad_idx = 2 * (ndim - 1 - gather_dim)
-                pad_spec[pad_idx + 1] = pad_amount
-                stacked_local = torch.nn.functional.pad(stacked_local, pad_spec)
-
+            packed = self._pack_local(entry, config)
+            stacked_local = packed["stacked_local"]
+            has_grad = packed["has_grad"]
+            gather_dim = packed["gather_dim"]
+            original_local_size = packed["original_local_size"]
+            max_local_size = packed["max_local_size"]
+            global_dim_size = packed["global_dim_size"]
             if instr:
                 ev["pack_e"].record()
                 stat["with_grad_count"] = int(sum(has_grad))
@@ -886,16 +1142,9 @@ class DistributedMuon(Optimizer):
 
             gather_list = entry["gather_list"]
             entry["gather_list"] = None
-            # Reconstruct full global tensor, stripping per-rank padding if needed.
-            remainder = global_dim_size % world_size
-            if remainder == 0:
-                stacked_full = torch.cat(gather_list, dim=gather_dim)
-            else:
-                real_chunks = []
-                for r in range(world_size):
-                    real_size = max_local_size if r < remainder else (global_dim_size // world_size)
-                    real_chunks.append(gather_list[r].narrow(gather_dim, 0, real_size))
-                stacked_full = torch.cat(real_chunks, dim=gather_dim)
+            stacked_full = self._cat_shards(
+                gather_list, gather_dim, global_dim_size, world_size
+            )
             del gather_list
             if instr:
                 ev["ag_e"].record()
@@ -915,31 +1164,12 @@ class DistributedMuon(Optimizer):
             if instr:
                 ev["apply_s"].record()
             # Phase 4: Local scatter + apply update
-            lr = config["lr"]
-            weight_decay = config["weight_decay"]
-            adjusted_lr = entry["adjusted_lr"]
-            chunk_floor = global_dim_size // world_size
-            shard_start = entry["rank"] * chunk_floor + min(entry["rank"], remainder)
+            shard_start, _ = self._shard_span(global_dim_size, world_size, entry["rank"])
             local_ortho_batch = stacked_ortho.narrow(
                 gather_dim, shard_start, original_local_size
             ).contiguous()
             del stacked_ortho
-
-            last_read = -1
-            for i, p in enumerate(params):
-                if not has_grad[i]:
-                    continue
-                ortho_local = local_ortho_batch[i]
-                p_local = p.to_local() if isinstance(p, DTensor) else p
-
-                if weight_decay != 0.0:
-                    p_local.mul_(1 - lr * weight_decay)
-
-                p_local.add_(ortho_local.to(dtype=p_local.dtype), alpha=-adjusted_lr)
-                # The AG-derived ``local_ortho_batch`` slice for index ``i``
-                # is last read here; once this iteration finishes for the
-                # highest ``i`` with grad, the buffer is safe to overwrite.
-                last_read = i
+            last_read = self._apply_ortho(entry, local_ortho_batch, has_grad, config)
 
             if instr:
                 ev["apply_e"].record()
