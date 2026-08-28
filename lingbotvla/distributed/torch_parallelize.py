@@ -56,6 +56,16 @@ logger = logging.get_logger(__name__)
 # Why: report/01_reshard_after_backward/README.md §2-3, 附录 A.2
 _KEEP_RESHARD_AFTER_BACKWARD = os.environ.get("LINGBOT_KEEP_RESHARD_AFTER_BACKWARD", "0") == "1"
 
+# ReduceScatter 线上 dtype。默认 fp32 ⇒ 与原字面量逐位等价。
+# 只作用于 mp_fsdp_kwargs 那族（36 层 VLM decoder + root，param_dtype=bf16 ⇒ 梯度
+# 产出来就是 bf16，upcast 成 fp32 上环是白付一倍字节）。⛔ 上面 enable_fp32 那族的
+# param_dtype 是 fp32、梯度真是 fp32，降 bf16 = 截 16 位尾数，而它 98.7% 藏在
+# backward 影子里、全转只值 ~4 ms ⇒ 不要一起改。
+# Why: report/07_fsdp2_reduce_scatter_bf16/README.md §2
+_FSDP2_REDUCE_DTYPE = {"fp32": torch.float32, "bf16": torch.bfloat16}[
+    os.environ.get("LINGBOT_FSDP2_REDUCE_DTYPE", "fp32")
+]
+
 def _wire_dualcall_forward_prefetch(model: "nn.Module", depth: int = 1) -> None:
     """Chain forward prefetch along the real dual-call execution order.
 
@@ -281,9 +291,12 @@ def build_parallelize_model(
 
             mp_fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(
                     param_dtype=torch.bfloat16,
-                    reduce_dtype=torch.float32,
+                    reduce_dtype=_FSDP2_REDUCE_DTYPE,
                     output_dtype=torch.bfloat16,
                 )
+            # 唯一的生效判据：env 给了但代码没到位时，训练会静默按 fp32 跑。
+            if _FSDP2_REDUCE_DTYPE is not torch.float32:
+                logger.info_rank0(f"LINGBOT_FSDP2_REDUCE_DTYPE: RS wire dtype = {_FSDP2_REDUCE_DTYPE}")
             ignore_modules_in_mixed_precision = tuple()
             if hasattr(model, "get_ignore_modules_in_mixed_precision"):
                 ignore_modules_in_mixed_precision = model.get_ignore_modules_in_mixed_precision()
