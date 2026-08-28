@@ -1,3 +1,5 @@
+import os
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -29,6 +31,12 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 
 
 logger = logging.get_logger(__name__)
+
+# 视觉位置编码前导的两个缓存门。均默认关 ⇒ 与原字面量逐位等价。
+# 背景与 bitwise 论证见 report/08_visual_pos_embed_cache/README.md §3-4。
+_ROTPOS_CACHE = os.environ.get("LINGBOT_VISUAL_ROTPOS_CACHE", "0") == "1"
+_POSEMB_CACHE = os.environ.get("LINGBOT_VISUAL_POSEMB_CACHE", "0") == "1"
+_POSEMB_STRICT = os.environ.get("LINGBOT_VISUAL_POSEMB_CACHE_STRICT", "0") == "1"
 
 
 def _qwen3vl_no_init_weights(self, module):
@@ -258,6 +266,56 @@ class Qwen3VLForConditionalGeneration(_Qwen3VLForConditionalGeneration, Generati
 
 
 @torch.compiler.disable
+def _build_posemb_plan(self, grid_thw):
+    """只算 fast_pos_embed_interpolate 里每步不变的结构量。
+
+    与 HF 原实现逐条同路（linspace 仍落 CPU、仍走 tolist/torch.tensor），
+    差别只是 h/w/t 用 python int 而非 0-dim CUDA tensor（后者本来也是 __index__
+    成同一个 int）⇒ idx/weight 逐位相同。
+    """
+    n = self.num_grid_per_side
+    merge = self.config.spatial_merge_size
+    idx_list, weight_list = [[] for _ in range(4)], [[] for _ in range(4)]
+    ts, split, shapes = [], [], []
+    for t, h, w in grid_thw.tolist():
+        h_idxs = torch.linspace(0, n - 1, h)
+        w_idxs = torch.linspace(0, n - 1, w)
+        h_floor, w_floor = h_idxs.int(), w_idxs.int()
+        h_ceil = (h_idxs.int() + 1).clip(max=n - 1)
+        w_ceil = (w_idxs.int() + 1).clip(max=n - 1)
+        dh, dw = h_idxs - h_floor, w_idxs - w_floor
+        base_h, base_h_ceil = h_floor * n, h_ceil * n
+        indices = [
+            (base_h[None].T + w_floor[None]).flatten(),
+            (base_h[None].T + w_ceil[None]).flatten(),
+            (base_h_ceil[None].T + w_floor[None]).flatten(),
+            (base_h_ceil[None].T + w_ceil[None]).flatten(),
+        ]
+        weights = [
+            ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
+            ((1 - dh)[None].T * dw[None]).flatten(),
+            (dh[None].T * (1 - dw)[None]).flatten(),
+            (dh[None].T * dw[None]).flatten(),
+        ]
+        for i in range(4):
+            idx_list[i].extend(indices[i].tolist())
+            weight_list[i].extend(weights[i].tolist())
+        ts.append(t)
+        split.append(h * w)
+        shapes.append((t, h // merge, merge, w // merge, merge, -1))
+    dev = self.pos_embed.weight.device
+    return {
+        "key": tuple(grid_thw.shape),
+        "grid_thw": grid_thw.clone(),
+        "idx": torch.tensor(idx_list, dtype=torch.long, device=dev),
+        "weight": torch.tensor(weight_list, dtype=self.pos_embed.weight.dtype, device=dev),
+        "ts": ts,
+        "split": split,
+        "shapes": shapes,
+    }
+
+
+@torch.compiler.disable
 def preprcess_grid_thw(self, grid_thw: torch.Tensor):
     rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
@@ -276,6 +334,29 @@ def preprcess_grid_thw(self, grid_thw: torch.Tensor):
     return None, position_embeddings, cu_seqlens, split_sizes, max_seqlen
 
 
+@torch.compiler.disable
+def fast_pos_embed_interpolate_cached(self, grid_thw):
+    """缓存结构量，把 gather-加权和留在线上每步跑。
+
+    ⛔ 不缓存输出：pos_embed 是可训练的 nn.Embedding（freeze_vision_encoder=false）。
+    """
+    plan = getattr(self, "_lingbot_posemb_plan", None)
+    if plan is None or plan["key"] != tuple(grid_thw.shape):
+        plan = _build_posemb_plan(self, grid_thw)
+        self._lingbot_posemb_plan = plan
+        logger.info(f"LINGBOT_VISUAL_POSEMB_CACHE: plan built for grid_thw{plan['key']}")
+    elif _POSEMB_STRICT and not torch.equal(grid_thw, plan["grid_thw"]):
+        raise RuntimeError("grid_thw 内容变了但形状没变 —— 结构量缓存会过期")
+
+    pos_embeds = self.pos_embed(plan["idx"]) * plan["weight"][:, :, None]
+    patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
+    out = []
+    for pos_embed, t, shape in zip(patch_pos_embeds.split(plan["split"]), plan["ts"], plan["shapes"]):
+        pos_embed = pos_embed.repeat(t, 1)
+        out.append(pos_embed.view(*shape).permute(0, 1, 3, 2, 4, 5).flatten(0, 4))
+    return torch.cat(out)
+
+
 def forward_without_grid_thw(
     self,
     hidden_states: torch.Tensor,
@@ -288,7 +369,12 @@ def forward_without_grid_thw(
 ) -> torch.Tensor:
     hidden_states = self.patch_embed(hidden_states)
 
-    if pos_embeds is None or position_embeddings is None or cu_seqlens is None or max_seqlen is None:
+    # pos_embeds 恒为 None（preprcess_grid_thw 的第一个返回值就是 None）⇒ 原条件恒真
+    # ⇒ 外层 precompute_grid_thw 缓存的另外三个量从未生效。开门后只看那三个。
+    need = position_embeddings is None or cu_seqlens is None or max_seqlen is None
+    if not _ROTPOS_CACHE:
+        need = need or pos_embeds is None
+    if need:
         pos_embeds, position_embeddings, cu_seqlens, _, max_seqlen = self.preprcess_grid_thw(grid_thw)
     if pos_embeds is None:
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
@@ -327,3 +413,8 @@ def apply_lingbot_qwen3_vl_patch():
     hf_qwen3vl.Qwen3VLVisionBlock = Qwen3VLVisionBlock
     hf_qwen3vl.Qwen3VLVisionModel.forward = forward_without_grid_thw
     hf_qwen3vl.Qwen3VLVisionModel.preprcess_grid_thw = preprcess_grid_thw
+    if _POSEMB_CACHE:
+        hf_qwen3vl.Qwen3VLVisionModel.fast_pos_embed_interpolate = fast_pos_embed_interpolate_cached
+        logger.info("LINGBOT_VISUAL_POSEMB_CACHE=1: fast_pos_embed_interpolate 只缓存结构量。")
+    if _ROTPOS_CACHE:
+        logger.info("LINGBOT_VISUAL_ROTPOS_CACHE=1: rot_pos_emb 复用外层 precompute_grid_thw 缓存。")
